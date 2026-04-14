@@ -3,15 +3,73 @@ import NetworkExtension
 import Darwin
 
 enum TunFileDescriptorResolver {
+    enum DebugFallbackMode {
+        case disabled
+        case scanOpenFileDescriptors(maxFD: Int32)
+    }
+
+    enum ResolutionFailure: CustomStringConvertible {
+        case noCandidateValuesFound
+        case candidateValuesWithoutFileDescriptors
+        case candidatesWereNotUTUN([Int32])
+        case debugScanDidNotFindUTUN(maxFD: Int32)
+
+        var description: String {
+            switch self {
+            case .noCandidateValuesFound:
+                return "No packetFlow candidate values were readable for UTUN descriptor extraction."
+            case .candidateValuesWithoutFileDescriptors:
+                return "PacketFlow candidate values were found, but no file descriptors could be extracted."
+            case let .candidatesWereNotUTUN(descriptors):
+                return "Extracted candidate descriptors are not UTUN sockets: \(descriptors)."
+            case let .debugScanDidNotFindUTUN(maxFD):
+                return "Debug fallback scan did not find a UTUN descriptor in range 0..<\(maxFD)."
+            }
+        }
+    }
+
+    struct ResolutionDiagnostics {
+        let attempts: Int
+        let candidateDescriptors: [Int32]
+        let failure: ResolutionFailure
+    }
+
+    struct ResolutionResult {
+        let fileDescriptor: Int32?
+        let diagnostics: ResolutionDiagnostics?
+    }
+
     static func resolveUTUNFileDescriptor(
         from packetFlow: NEPacketTunnelFlow,
         attempts: Int = 20,
         retryDelayMicroseconds: useconds_t = 100_000
     ) -> Int32? {
+        resolveUTUNFileDescriptorDetailed(
+            from: packetFlow,
+            attempts: attempts,
+            retryDelayMicroseconds: retryDelayMicroseconds,
+            debugFallback: .disabled
+        ).fileDescriptor
+    }
+
+    static func resolveUTUNFileDescriptorDetailed(
+        from packetFlow: NEPacketTunnelFlow,
+        attempts: Int = 20,
+        retryDelayMicroseconds: useconds_t = 100_000,
+        debugFallback: DebugFallbackMode = .disabled
+    ) -> ResolutionResult {
         let retries = max(1, attempts)
+        var lastFailure: ResolutionFailure = .noCandidateValuesFound
+        var lastCandidateDescriptors: [Int32] = []
+
         for attempt in 1...retries {
-            if let fd = resolveOnce(from: packetFlow) {
-                return fd
+            let attemptResult = resolveOnceDetailed(from: packetFlow)
+            switch attemptResult {
+            case let .resolved(fd):
+                return ResolutionResult(fileDescriptor: fd, diagnostics: nil)
+            case let .failed(failure, candidates):
+                lastFailure = failure
+                lastCandidateDescriptors = candidates
             }
 
             if attempt < retries {
@@ -19,10 +77,35 @@ enum TunFileDescriptorResolver {
             }
         }
 
-        return nil
+        if case let .scanOpenFileDescriptors(maxFD) = debugFallback,
+           let scanned = scanForUTUNFileDescriptor(maxFD: maxFD) {
+            return ResolutionResult(fileDescriptor: scanned, diagnostics: nil)
+        }
+
+        let finalFailure: ResolutionFailure
+        switch debugFallback {
+        case .disabled:
+            finalFailure = lastFailure
+        case let .scanOpenFileDescriptors(maxFD):
+            finalFailure = .debugScanDidNotFindUTUN(maxFD: maxFD)
+        }
+
+        return ResolutionResult(
+            fileDescriptor: nil,
+            diagnostics: ResolutionDiagnostics(
+                attempts: retries,
+                candidateDescriptors: lastCandidateDescriptors,
+                failure: finalFailure
+            )
+        )
     }
 
-    private static func resolveOnce(from packetFlow: NEPacketTunnelFlow) -> Int32? {
+    private enum ResolveOnceResult {
+        case resolved(Int32)
+        case failed(ResolutionFailure, [Int32])
+    }
+
+    private static func resolveOnceDetailed(from packetFlow: NEPacketTunnelFlow) -> ResolveOnceResult {
         let keyPaths = [
             "socket.fileDescriptor",
             "socket.fileDescriptorNumber",
@@ -33,26 +116,40 @@ enum TunFileDescriptorResolver {
             "_fileDescriptor"
         ]
 
+        var sawCandidateValue = false
+        var candidateDescriptors: [Int32] = []
+
         for keyPath in keyPaths {
             guard let raw = safeValue(forKeyPath: keyPath, on: packetFlow as NSObject) else {
                 continue
             }
-            if let fd = extractFileDescriptor(from: raw), isUTUNFileDescriptor(fd) {
-                return fd
+            sawCandidateValue = true
+            if let fd = extractFileDescriptor(from: raw) {
+                candidateDescriptors.append(fd)
+                if isUTUNFileDescriptor(fd) {
+                    return .resolved(fd)
+                }
             }
         }
 
-        if let socketObject = safeValue(forKey: "socket", on: packetFlow as NSObject),
-           let fd = extractFileDescriptor(from: socketObject),
-           isUTUNFileDescriptor(fd) {
-            return fd
+        if let socketObject = safeValue(forKey: "socket", on: packetFlow as NSObject) {
+            sawCandidateValue = true
+            if let fd = extractFileDescriptor(from: socketObject) {
+                candidateDescriptors.append(fd)
+                if isUTUNFileDescriptor(fd) {
+                    return .resolved(fd)
+                }
+            }
         }
 
-        if let scanned = scanForUTUNFileDescriptor() {
-            return scanned
+        let uniqueCandidates = Array(Set(candidateDescriptors)).sorted()
+        if !sawCandidateValue {
+            return .failed(.noCandidateValuesFound, uniqueCandidates)
         }
-
-        return nil
+        if uniqueCandidates.isEmpty {
+            return .failed(.candidateValuesWithoutFileDescriptors, uniqueCandidates)
+        }
+        return .failed(.candidatesWereNotUTUN(uniqueCandidates), uniqueCandidates)
     }
 
     private static func extractFileDescriptor(from raw: Any) -> Int32? {
@@ -110,7 +207,7 @@ enum TunFileDescriptorResolver {
         return current
     }
 
-    private static func scanForUTUNFileDescriptor(maxFD: Int32 = 4096) -> Int32? {
+    private static func scanForUTUNFileDescriptor(maxFD: Int32) -> Int32? {
         var fd: Int32 = 0
         while fd < maxFD {
             if isUTUNFileDescriptor(fd) {

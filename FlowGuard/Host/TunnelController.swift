@@ -5,9 +5,11 @@ enum TunnelControllerError: LocalizedError {
     case simulatorUnsupported
     case networkExtensionIPCUnavailable
     case networkExtensionPermissionDenied
+    case managerNotInstalled
     case invalidSession
     case invalidResponse
     case providerError(String)
+    case startupFailed(String)
     case startupTimedOut(String)
 
     var errorDescription: String? {
@@ -18,12 +20,16 @@ enum TunnelControllerError: LocalizedError {
             return "Network Extension IPC failed. Verify a physical device, Packet Tunnel extension target, and signing entitlements/capabilities."
         case .networkExtensionPermissionDenied:
             return "Network Extension permission denied. Verify your Apple Developer team, provisioning profile, and Packet Tunnel entitlements/capabilities."
+        case .managerNotInstalled:
+            return "Tunnel configuration is not installed. Install configuration first."
         case .invalidSession:
             return "The Network Extension session is unavailable."
         case .invalidResponse:
             return "The tunnel provider returned an invalid response payload."
         case let .providerError(message):
             return "Provider error: \(message)"
+        case let .startupFailed(message):
+            return "Tunnel failed to start: \(message)"
         case let .startupTimedOut(message):
             return "Tunnel did not enter connected state: \(message)"
         }
@@ -53,36 +59,34 @@ final class TunnelController {
 
     private let managerDescription = "FlowGuard Local Tunnel"
     private let providerBundleIdentifier = "io.jawziyya.flowguard.tunnel"
+    private let installedManagerCacheTTL: TimeInterval = 5
+    private let configurationStore: TunnelConfigurationStore
+    private var cachedInstalledManager: NETunnelProviderManager?
+    private var cachedInstalledManagerLoadedAt: Date?
+
+    init(configurationStore: TunnelConfigurationStore = AppGroupPaths.makeTunnelConfigurationStore()) {
+        self.configurationStore = configurationStore
+    }
 
     func loadOrCreateManager() async throws -> NETunnelProviderManager {
-        try ensureSupportedEnvironment()
-        do {
-            let managers = try await NETunnelProviderManager.loadAllFromPreferencesAsync()
-            if let existing = managers.first(where: { $0.localizedDescription == managerDescription }) {
-                return try await normalizeAndPersistManager(existing)
-            }
-
-            let manager = NETunnelProviderManager()
-            let proto = NETunnelProviderProtocol()
-            proto.providerBundleIdentifier = providerBundleIdentifier
-            proto.serverAddress = "127.0.0.1"
-            manager.protocolConfiguration = proto
-            manager.localizedDescription = managerDescription
-            manager.isEnabled = true
-
-            return try await normalizeAndPersistManager(manager)
-        } catch {
-            throw TunnelControllerError.map(error)
-        }
+        try await loadOrCreateManagerForInstall()
     }
 
     func install(profile: TunnelProfile) async throws {
         do {
-            let manager = try await loadOrCreateManager()
-            try AppGroupPaths.write(profile, to: try AppGroupPaths.profileURL())
-            manager.isEnabled = true
-            try await manager.saveToPreferencesAsync()
-            try await manager.loadFromPreferencesAsync()
+            let manager = try await loadOrCreateManagerForInstall()
+            try configurationStore.saveProfile(profile)
+            var didMutate = applyStandardManagerConfiguration(manager)
+            if !manager.isEnabled {
+                manager.isEnabled = true
+                didMutate = true
+            }
+
+            if didMutate {
+                try await manager.saveToPreferencesAsync()
+                try await manager.loadFromPreferencesAsync()
+            }
+            cacheInstalledManager(manager)
         } catch {
             throw TunnelControllerError.map(error)
         }
@@ -90,25 +94,25 @@ final class TunnelController {
 
     func connect() async throws {
         do {
-            let manager = try await loadOrCreateManager()
+            let manager = try await loadInstalledManager(forceRefresh: true)
             try await manager.loadFromPreferencesAsync()
-            let profile = (try? AppGroupPaths.read(TunnelProfile.self, from: try AppGroupPaths.profileURL())) ?? .default
+            let profile = (try configurationStore.loadProfile()) ?? .default
             try manager.connection.startVPNTunnel(options: ProviderStartOptions.makeDictionary(profile: profile))
-            try await waitForConnectedStatus(manager.connection)
+            _ = try await waitForConnectedStatus(manager.connection)
+            cacheInstalledManager(manager)
         } catch {
             throw TunnelControllerError.map(error)
         }
     }
 
     func connectionStatus() async throws -> NEVPNStatus {
-        let manager = try await loadOrCreateManager()
-        try await manager.loadFromPreferencesAsync()
+        let manager = try await loadInstalledManager()
         return manager.connection.status
     }
 
     func disconnect() async throws {
         do {
-            let manager = try await loadOrCreateManager()
+            let manager = try await loadInstalledManager(forceRefresh: true)
             try await manager.loadFromPreferencesAsync()
             manager.connection.stopVPNTunnel()
         } catch {
@@ -120,12 +124,12 @@ final class TunnelController {
         try await sendCommand(.init(action: .reloadProfile))
     }
 
-    func requestStats() async throws -> RuntimeStats {
+    func requestStats() async throws -> (stats: RuntimeStats, state: ProviderState?) {
         let response = try await sendCommand(.init(action: .collectStats))
         guard let stats = response.stats else {
             throw TunnelControllerError.invalidResponse
         }
-        return stats
+        return (stats: stats, state: response.state)
     }
 
     func requestLogs() async throws -> String {
@@ -135,10 +139,10 @@ final class TunnelController {
 
     private func sendCommand(_ command: ProviderCommand) async throws -> ProviderMessage {
         do {
-            let manager = try await loadOrCreateManager()
-            try await manager.loadFromPreferencesAsync()
+            let manager = try await loadInstalledManager()
 
             guard let session = manager.connection as? NETunnelProviderSession else {
+                invalidateInstalledManagerCache()
                 throw TunnelControllerError.invalidSession
             }
 
@@ -151,7 +155,16 @@ final class TunnelController {
             }
             return message
         } catch {
-            throw TunnelControllerError.map(error)
+            let mapped = TunnelControllerError.map(error)
+            if let controllerError = mapped as? TunnelControllerError {
+                switch controllerError {
+                case .invalidSession, .managerNotInstalled, .networkExtensionIPCUnavailable:
+                    invalidateInstalledManagerCache()
+                default:
+                    break
+                }
+            }
+            throw mapped
         }
     }
 
@@ -161,24 +174,94 @@ final class TunnelController {
         #endif
     }
 
-    private func normalizeAndPersistManager(_ manager: NETunnelProviderManager) async throws -> NETunnelProviderManager {
-        let proto = (manager.protocolConfiguration as? NETunnelProviderProtocol) ?? NETunnelProviderProtocol()
-        proto.providerBundleIdentifier = providerBundleIdentifier
-        proto.serverAddress = "127.0.0.1"
-        manager.protocolConfiguration = proto
-        manager.localizedDescription = managerDescription
-        manager.isEnabled = true
-        try await manager.saveToPreferencesAsync()
-        try await manager.loadFromPreferencesAsync()
+    private func loadOrCreateManagerForInstall() async throws -> NETunnelProviderManager {
+        try ensureSupportedEnvironment()
+        do {
+            if let existing = try await loadExistingManager() {
+                cacheInstalledManager(existing)
+                return existing
+            }
+
+            let manager = NETunnelProviderManager()
+            _ = applyStandardManagerConfiguration(manager)
+            manager.isEnabled = true
+            try await manager.saveToPreferencesAsync()
+            try await manager.loadFromPreferencesAsync()
+            cacheInstalledManager(manager)
+            return manager
+        } catch {
+            throw TunnelControllerError.map(error)
+        }
+    }
+
+    private func loadInstalledManager(forceRefresh: Bool = false) async throws -> NETunnelProviderManager {
+        try ensureSupportedEnvironment()
+        if !forceRefresh, let cached = cachedInstalledManager, let loadedAt = cachedInstalledManagerLoadedAt {
+            if Date().timeIntervalSince(loadedAt) < installedManagerCacheTTL {
+                return cached
+            }
+        }
+
+        guard let manager = try await loadExistingManager() else {
+            invalidateInstalledManagerCache()
+            throw TunnelControllerError.managerNotInstalled
+        }
+        cacheInstalledManager(manager)
         return manager
     }
 
-    private func waitForConnectedStatus(_ connection: NEVPNConnection) async throws {
+    private func cacheInstalledManager(_ manager: NETunnelProviderManager) {
+        cachedInstalledManager = manager
+        cachedInstalledManagerLoadedAt = Date()
+    }
+
+    private func invalidateInstalledManagerCache() {
+        cachedInstalledManager = nil
+        cachedInstalledManagerLoadedAt = nil
+    }
+
+    private func loadExistingManager() async throws -> NETunnelProviderManager? {
+        let managers = try await NETunnelProviderManager.loadAllFromPreferencesAsync()
+        return managers.first(where: { $0.localizedDescription == managerDescription })
+    }
+
+    @discardableResult
+    private func applyStandardManagerConfiguration(_ manager: NETunnelProviderManager) -> Bool {
+        var didMutate = false
+
+        let proto = (manager.protocolConfiguration as? NETunnelProviderProtocol) ?? NETunnelProviderProtocol()
+        if manager.protocolConfiguration as? NETunnelProviderProtocol == nil {
+            didMutate = true
+        }
+
+        if proto.providerBundleIdentifier != providerBundleIdentifier {
+            didMutate = true
+        }
+        proto.providerBundleIdentifier = providerBundleIdentifier
+
+        if proto.serverAddress != "127.0.0.1" {
+            didMutate = true
+        }
+        proto.serverAddress = "127.0.0.1"
+
+        if manager.localizedDescription != managerDescription {
+            didMutate = true
+        }
+        manager.protocolConfiguration = proto
+        manager.localizedDescription = managerDescription
+
+        return didMutate
+    }
+
+    private func waitForConnectedStatus(_ connection: NEVPNConnection) async throws -> Bool {
         for _ in 0..<20 {
-            switch connection.status {
+            let status = connection.status
+            switch status {
             case .connected, .reasserting:
-                return
-            case .disconnecting, .disconnected, .invalid:
+                return true
+            case .disconnected, .invalid:
+                throw TunnelControllerError.startupFailed(status.readableName)
+            case .disconnecting:
                 break
             case .connecting:
                 break
@@ -187,7 +270,11 @@ final class TunnelController {
             }
             try await Task.sleep(nanoseconds: 500_000_000)
         }
-        throw TunnelControllerError.startupTimedOut(connection.status.readableName)
+        let tailStatus = connection.status
+        if tailStatus == .connecting || tailStatus == .reasserting {
+            return false
+        }
+        throw TunnelControllerError.startupTimedOut(tailStatus.readableName)
     }
 }
 

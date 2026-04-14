@@ -6,15 +6,24 @@ enum ProviderStartOptions {
     static let dnsServer = "DNSServer"
     static let socksPort = "SOCKSPort"
     static let preset = "Preset"
+    static let tunnelImplementationMode = "flowguard.tunnelImplementationMode"
+    static let tunnelImplementationModeEnv = "FLOWGUARD_TUNNEL_IMPLEMENTATION_MODE"
 
     static func makeDictionary(profile: TunnelProfile) -> [String: NSObject] {
-        [
+        var options: [String: NSObject] = [
             args: profile.byedpiArguments as NSArray,
             ipv6: NSNumber(value: profile.ipv6Enabled),
             dnsServer: profile.primaryDNSServer as NSString,
             socksPort: NSNumber(value: profile.socksPort),
             preset: profile.preset.rawValue as NSString
         ]
+
+        #if DEBUG
+        let debugMode = ProcessInfo.processInfo.environment[tunnelImplementationModeEnv] ?? "packetFlowExperimental"
+        options[tunnelImplementationMode] = debugMode as NSString
+        #endif
+
+        return options
     }
 
     static func mergedProfile(from options: [String: NSObject]?, base: TunnelProfile) -> TunnelProfile {

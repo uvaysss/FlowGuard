@@ -39,7 +39,7 @@ struct ContentView: View {
 
                     Picker("Preset", selection: $viewModel.profile.preset) {
                         ForEach(ByeDPIPreset.allCases, id: \.self) { preset in
-                            Text(preset.rawValue.capitalized).tag(preset)
+                            Text(preset.title).tag(preset)
                         }
                     }
                     Toggle("Enable IPv6", isOn: $viewModel.profile.ipv6Enabled)
@@ -150,6 +150,21 @@ private extension DNSMode {
             return "DoH"
         case .plain:
             return "Plain"
+        }
+    }
+}
+
+private extension ByeDPIPreset {
+    var title: String {
+        switch self {
+        case .conservative:
+            return "Conservative"
+        case .balanced:
+            return "Balanced"
+        case .aggressive:
+            return "Aggressive"
+        case .forYoutube:
+            return "For Youtube"
         }
     }
 }

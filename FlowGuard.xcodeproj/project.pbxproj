@@ -455,7 +455,7 @@
 					"$(PROJECT_DIR)/VendorArtifacts/hev-socks5-tunnel",
 				);
 				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = Config/FlowGuardTunnel-Info.plist;
+				INFOPLIST_FILE = "Config/FlowGuardTunnel-Info.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -506,7 +506,7 @@
 				CODE_SIGN_ENTITLEMENTS = FlowGuardTunnel/FlowGuardTunnel.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "iPhone Developer";
-				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGN_STYLE = Manual;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = "";
 				"DEVELOPMENT_TEAM[sdk=iphoneos*]" = 486STKKP6Y;
@@ -515,7 +515,7 @@
 					"$(PROJECT_DIR)/VendorArtifacts/hev-socks5-tunnel",
 				);
 				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = Config/FlowGuardTunnel-Info.plist;
+				INFOPLIST_FILE = "Config/FlowGuardTunnel-Info.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -551,7 +551,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = io.jawziyya.flowguard.tunnel;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
-				"PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]" = "";
+				"PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]" = "match Development io.jawziyya.flowguard.tunnel";
 				SKIP_INSTALL = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_EMIT_LOC_STRINGS = YES;
