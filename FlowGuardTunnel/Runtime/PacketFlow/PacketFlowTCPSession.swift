@@ -5,7 +5,7 @@ final class PacketFlowTCPSession {
     let createdAt: Date
     private(set) var lastSeenAt: Date
     private(set) var state: TCPSessionState
-    private(set) var stream: SOCKS5TCPStream?
+    private(set) var stream: (any SOCKS5TCPStreaming)?
     private let upstreamBuffer: BoundedDataQueue
     private(set) var clientNextSequence: UInt32 = 0
     private(set) var remoteNextSequence: UInt32 = 0
@@ -44,7 +44,7 @@ final class PacketFlowTCPSession {
         return upstreamBuffer.drain()
     }
 
-    func attachStream(_ stream: SOCKS5TCPStream) {
+    func attachStream(_ stream: any SOCKS5TCPStreaming) {
         self.stream = stream
         touch()
     }

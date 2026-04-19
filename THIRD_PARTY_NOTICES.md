@@ -10,7 +10,7 @@ This repository vendors and/or links the following upstream projects:
 ## hev-socks5-tunnel
 - Project: https://github.com/heiher/hev-socks5-tunnel
 - License: BSD-3-Clause
-- Usage: tun2socks bridge between packet tunnel traffic and local SOCKS5 endpoint.
+- Usage: retained as a vendored upstream dependency; not linked into the current packet-flow runtime path.
 
 ## Licensing posture for FlowGuard
 

@@ -2,6 +2,16 @@ import Darwin
 import Foundation
 import Network
 
+protocol SOCKS5UDPAssociationing: AnyObject {
+    func send(datagram: SOCKS5UDPDatagram, completion: @escaping (Error?) -> Void)
+    func receiveLoop(onDatagram: @escaping (SOCKS5UDPDatagram) -> Void, onComplete: @escaping (Error?) -> Void)
+    func close()
+}
+
+protocol SOCKS5UDPAssociating {
+    func open(socksPort: Int, completion: @escaping (Result<any SOCKS5UDPAssociationing, Error>) -> Void)
+}
+
 struct SOCKS5UDPDatagram: Sendable {
     let destinationHost: String
     let destinationPort: UInt16
@@ -180,12 +190,27 @@ final class SOCKS5UDPAssociation {
     }
 }
 
-final class SOCKS5UDPAssociateClient {
+extension SOCKS5UDPAssociation: SOCKS5UDPAssociationing {}
+
+final class SOCKS5UDPAssociateClient: SOCKS5UDPAssociating {
     private let queue = DispatchQueue(label: "com.uvays.FlowGuard.packetflow.socks5-udp")
 
-    func open(socksPort: Int, completion: @escaping (Result<SOCKS5UDPAssociation, Error>) -> Void) {
+    func open(socksPort: Int, completion: @escaping (Result<any SOCKS5UDPAssociationing, Error>) -> Void) {
+        let completionLock = NSLock()
+        var didComplete = false
+        let finish: (Result<any SOCKS5UDPAssociationing, Error>) -> Void = { result in
+            completionLock.lock()
+            let shouldComplete = !didComplete
+            if shouldComplete {
+                didComplete = true
+            }
+            completionLock.unlock()
+            guard shouldComplete else { return }
+            completion(result)
+        }
+
         guard let socksEndpointPort = NWEndpoint.Port(rawValue: UInt16(socksPort)) else {
-            completion(.failure(SOCKS5UDPAssociateError.invalidServerPort))
+            finish(.failure(SOCKS5UDPAssociateError.invalidServerPort))
             return
         }
 
@@ -193,11 +218,11 @@ final class SOCKS5UDPAssociateClient {
         control.stateUpdateHandler = { state in
             switch state {
             case .ready:
-                self.performHandshake(control: control, completion: completion)
+                self.performHandshake(control: control, completion: finish)
             case let .failed(error):
-                completion(.failure(SOCKS5UDPAssociateError.connectionFailed(error.localizedDescription)))
+                finish(.failure(SOCKS5UDPAssociateError.connectionFailed(error.localizedDescription)))
             case .cancelled:
-                completion(.failure(SOCKS5UDPAssociateError.connectionFailed("Control connection cancelled")))
+                finish(.failure(SOCKS5UDPAssociateError.connectionFailed("Control connection cancelled")))
             default:
                 break
             }
@@ -207,10 +232,11 @@ final class SOCKS5UDPAssociateClient {
 
     private func performHandshake(
         control: NWConnection,
-        completion: @escaping (Result<SOCKS5UDPAssociation, Error>) -> Void
+        completion: @escaping (Result<any SOCKS5UDPAssociationing, Error>) -> Void
     ) {
         control.send(content: Data([0x05, 0x01, 0x00]), completion: .contentProcessed { error in
             if let error {
+                control.cancel()
                 completion(.failure(error))
                 return
             }
@@ -218,9 +244,11 @@ final class SOCKS5UDPAssociateClient {
             self.receiveExact(connection: control, length: 2) { methodResult in
                 switch methodResult {
                 case let .failure(error):
+                    control.cancel()
                     completion(.failure(error))
                 case let .success(method):
                     guard method.count == 2, method[0] == 0x05, method[1] == 0x00 else {
+                        control.cancel()
                         completion(.failure(SOCKS5UDPAssociateError.handshakeFailed("Method negotiation rejected")))
                         return
                     }
@@ -232,11 +260,12 @@ final class SOCKS5UDPAssociateClient {
 
     private func sendUDPAssociate(
         control: NWConnection,
-        completion: @escaping (Result<SOCKS5UDPAssociation, Error>) -> Void
+        completion: @escaping (Result<any SOCKS5UDPAssociationing, Error>) -> Void
     ) {
         let request = Data([0x05, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
         control.send(content: request, completion: .contentProcessed { error in
             if let error {
+                control.cancel()
                 completion(.failure(error))
                 return
             }
@@ -244,13 +273,16 @@ final class SOCKS5UDPAssociateClient {
             self.receiveExact(connection: control, length: 4) { headerResult in
                 switch headerResult {
                 case let .failure(error):
+                    control.cancel()
                     completion(.failure(error))
                 case let .success(header):
                     guard header.count == 4, header[0] == 0x05 else {
+                        control.cancel()
                         completion(.failure(SOCKS5UDPAssociateError.handshakeFailed("Invalid ASSOCIATE response")))
                         return
                     }
                     guard header[1] == 0x00 else {
+                        control.cancel()
                         completion(.failure(SOCKS5UDPAssociateError.handshakeFailed("ASSOCIATE failed with code \(header[1])")))
                         return
                     }
@@ -263,7 +295,7 @@ final class SOCKS5UDPAssociateClient {
     private func receiveAssociateBindAddress(
         control: NWConnection,
         atyp: UInt8,
-        completion: @escaping (Result<SOCKS5UDPAssociation, Error>) -> Void
+        completion: @escaping (Result<any SOCKS5UDPAssociationing, Error>) -> Void
     ) {
         switch atyp {
         case 0x01:
@@ -298,7 +330,7 @@ final class SOCKS5UDPAssociateClient {
         control: NWConnection,
         bindData: Data,
         atyp: UInt8
-    ) -> Result<SOCKS5UDPAssociation, Error> {
+    ) -> Result<any SOCKS5UDPAssociationing, Error> {
         let endpointResult = parseBindEndpoint(bindData: bindData, atyp: atyp)
         switch endpointResult {
         case let .failure(error):

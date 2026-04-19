@@ -17,14 +17,29 @@ struct DataPlaneTrafficSnapshot {
     let tcpConnectFailures: Int64
     let tcpSendAttempts: Int64
     let tcpSendFailures: Int64
+    let tcpBackpressureDrops: Int64
     let tcpActiveSessions: Int64
+    let tcpSessionCloseTotal: Int64
+    let tcpSessionCloseStateClose: Int64
+    let tcpSessionCloseSendFailed: Int64
+    let tcpSessionCloseRemoteClosed: Int64
+    let tcpSessionCloseBackpressureDrop: Int64
+    let tcpSessionCloseRelayStop: Int64
     let udpAssociateAttempts: Int64
     let udpAssociateFailures: Int64
     let udpTxPackets: Int64
     let udpRxPackets: Int64
     let udpTxFailures: Int64
+    let udpBackpressureDrops: Int64
     let udpActiveSessions: Int64
     let dnsRoutedCount: Int64
+    let udpSessionCloseTotal: Int64
+    let udpSessionCloseAssociateClosed: Int64
+    let udpSessionCloseAssociateFailed: Int64
+    let udpSessionCloseSendFailed: Int64
+    let udpSessionCloseBackpressureDrop: Int64
+    let udpSessionCloseIdleCleanup: Int64
+    let udpSessionCloseRelayStop: Int64
 }
 
 struct DataPlaneStopResult {
@@ -39,181 +54,21 @@ protocol TunnelDataPlane: AnyObject {
     func start(
         profile: TunnelProfile,
         packetFlow: NEPacketTunnelFlow?,
-        resolveTunFileDescriptor: () throws -> Int32,
         onExit: @escaping (Int32) -> Void,
         log: @escaping (String) -> Void
     ) throws -> DataPlaneStartResult
 
     func stop(
         context: String,
-        gracefulTimeout: TimeInterval,
-        forcedTimeout: TimeInterval,
         log: @escaping (String) -> Void
     ) -> DataPlaneStopResult
 
     func collectTrafficSnapshot() -> DataPlaneTrafficSnapshot?
 }
 
-final class LegacyTunFDDataPlane: TunnelDataPlane {
-    private let tun2socksEngine: Tun2SocksEngine
-    private let stateLock = NSLock()
-    private var running = false
-    private var trackedInterfaceName: String?
-    private var baselineBytesIn: UInt64 = 0
-    private var baselineBytesOut: UInt64 = 0
-
-    let mode: TunnelImplementationMode
-
-    var isRunning: Bool {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return running
-    }
-
-    init(mode: TunnelImplementationMode, tun2socksEngine: Tun2SocksEngine) {
-        self.mode = mode
-        self.tun2socksEngine = tun2socksEngine
-    }
-
-    func start(
-        profile: TunnelProfile,
-        packetFlow: NEPacketTunnelFlow?,
-        resolveTunFileDescriptor: () throws -> Int32,
-        onExit: @escaping (Int32) -> Void,
-        log: @escaping (String) -> Void
-    ) throws -> DataPlaneStartResult {
-        _ = packetFlow
-        let tunFD = try resolveTunFileDescriptor()
-        guard tunFD >= 0 else {
-            throw TunnelRuntimeError.invalidTunnelDescriptor
-        }
-        log("Resolved TUN descriptor: \(tunFD)")
-
-        let interfaceName = TunFileDescriptorResolver.utunInterfaceName(from: tunFD)
-        let counters = interfaceName.flatMap(TunFileDescriptorResolver.interfaceTrafficCounters(interfaceName:))
-        let baselineIn = counters?.bytesIn ?? 0
-        let baselineOut = counters?.bytesOut ?? 0
-        stateLock.lock()
-        trackedInterfaceName = interfaceName
-        baselineBytesIn = baselineIn
-        baselineBytesOut = baselineOut
-        stateLock.unlock()
-
-        if let interfaceName {
-            log("Resolved TUN interface: \(interfaceName)")
-        } else {
-            log("Failed to resolve TUN interface name from descriptor")
-        }
-
-        try tun2socksEngine.start(config: profile, tunFD: tunFD) { [weak self] exitCode in
-            self?.setRunning(false)
-            onExit(exitCode)
-        }
-
-        setRunning(true)
-        log("tun2socks started")
-
-        return DataPlaneStartResult(
-            tunInterfaceName: interfaceName,
-            baselineBytesIn: baselineIn,
-            baselineBytesOut: baselineOut
-        )
-    }
-
-    func stop(
-        context: String,
-        gracefulTimeout: TimeInterval,
-        forcedTimeout: TimeInterval,
-        log: @escaping (String) -> Void
-    ) -> DataPlaneStopResult {
-        do {
-            try tun2socksEngine.requestStop()
-            let stopped = tun2socksEngine.waitForExit(timeout: gracefulTimeout)
-            if stopped {
-                setRunning(false)
-                clearInterfaceTracking()
-                log("tun2socks stopped")
-                return DataPlaneStopResult(didStop: true, errorMessage: nil)
-            }
-
-            log("tun2socks did not stop within \(Int(gracefulTimeout))s, forcing shutdown")
-            tun2socksEngine.forceStop()
-            let forceStopped = tun2socksEngine.waitForExit(timeout: forcedTimeout)
-            if forceStopped {
-                setRunning(false)
-                clearInterfaceTracking()
-                log("tun2socks stopped after force-stop")
-                return DataPlaneStopResult(didStop: true, errorMessage: nil)
-            }
-
-            let message = "tun2socks did not exit after force-stop"
-            log(message)
-            return DataPlaneStopResult(didStop: false, errorMessage: "\(context) \(message)")
-        } catch {
-            log("tun2socks stop failed: \(error.localizedDescription)")
-            tun2socksEngine.forceStop()
-            if tun2socksEngine.waitForExit(timeout: forcedTimeout) {
-                setRunning(false)
-                clearInterfaceTracking()
-                log("tun2socks force-stopped after error")
-                return DataPlaneStopResult(didStop: true, errorMessage: nil)
-            }
-
-            let message = "tun2socks did not exit after force-stop following stop error"
-            log(message)
-            return DataPlaneStopResult(didStop: false, errorMessage: "\(context) \(message)")
-        }
-    }
-
-    func collectTrafficSnapshot() -> DataPlaneTrafficSnapshot? {
-        let snapshotState: (String?, UInt64, UInt64) = stateLock.withLock {
-            (trackedInterfaceName, baselineBytesIn, baselineBytesOut)
-        }
-
-        guard let interfaceName = snapshotState.0,
-              let counters = TunFileDescriptorResolver.interfaceTrafficCounters(interfaceName: interfaceName) else {
-            return nil
-        }
-
-        let deltaIn = counters.bytesIn >= snapshotState.1 ? counters.bytesIn - snapshotState.1 : 0
-        let deltaOut = counters.bytesOut >= snapshotState.2 ? counters.bytesOut - snapshotState.2 : 0
-        return DataPlaneTrafficSnapshot(
-            bytesIn: Int64(deltaIn),
-            bytesOut: Int64(deltaOut),
-            packetsIn: 0,
-            packetsOut: 0,
-            parseFailures: 0,
-            tcpConnectAttempts: 0,
-            tcpConnectFailures: 0,
-            tcpSendAttempts: 0,
-            tcpSendFailures: 0,
-            tcpActiveSessions: 0,
-            udpAssociateAttempts: 0,
-            udpAssociateFailures: 0,
-            udpTxPackets: 0,
-            udpRxPackets: 0,
-            udpTxFailures: 0,
-            udpActiveSessions: 0,
-            dnsRoutedCount: 0
-        )
-    }
-
-    private func setRunning(_ value: Bool) {
-        stateLock.lock()
-        running = value
-        stateLock.unlock()
-    }
-
-    private func clearInterfaceTracking() {
-        stateLock.lock()
-        trackedInterfaceName = nil
-        baselineBytesIn = 0
-        baselineBytesOut = 0
-        stateLock.unlock()
-    }
-}
-
 final class PacketFlowDataPlane: TunnelDataPlane {
+    private static let downstreamTCPPayloadChunkSize = 900
+
     private let stateLock = NSLock()
     private let sessionRegistry: PacketFlowSessionRegistry
     private let pump: PacketFlowPump
@@ -248,11 +103,9 @@ final class PacketFlowDataPlane: TunnelDataPlane {
     func start(
         profile: TunnelProfile,
         packetFlow: NEPacketTunnelFlow?,
-        resolveTunFileDescriptor: () throws -> Int32,
         onExit: @escaping (Int32) -> Void,
         log: @escaping (String) -> Void
     ) throws -> DataPlaneStartResult {
-        _ = resolveTunFileDescriptor
         _ = onExit
         _ = sessionRegistry.removeAllSessions(onRemove: { $0.closeStream() })
         logHandler = log
@@ -279,12 +132,8 @@ final class PacketFlowDataPlane: TunnelDataPlane {
 
     func stop(
         context: String,
-        gracefulTimeout: TimeInterval,
-        forcedTimeout: TimeInterval,
         log: @escaping (String) -> Void
     ) -> DataPlaneStopResult {
-        _ = gracefulTimeout
-        _ = forcedTimeout
         cancelSummaryTimer()
         pump.stop()
         tcpRelay.stop()
@@ -295,7 +144,7 @@ final class PacketFlowDataPlane: TunnelDataPlane {
         let snapshot = collectTrafficSnapshot()
         log("PacketFlow data plane stopped (\(context)); cleanedSessions=\(cleaned)")
         if let snapshot {
-            log("PacketFlow final metrics mode=\(mode.rawValue) bytesIn=\(snapshot.bytesIn) bytesOut=\(snapshot.bytesOut) packetsIn=\(snapshot.packetsIn) packetsOut=\(snapshot.packetsOut) tcpActive=\(snapshot.tcpActiveSessions) udpActive=\(snapshot.udpActiveSessions) tcpConnectFailures=\(snapshot.tcpConnectFailures) udpAssociateFailures=\(snapshot.udpAssociateFailures) udpTxFailures=\(snapshot.udpTxFailures) dnsRouted=\(snapshot.dnsRoutedCount) parseFailures=\(snapshot.parseFailures)")
+            log("PacketFlow final metrics mode=\(mode.rawValue) bytesIn=\(snapshot.bytesIn) bytesOut=\(snapshot.bytesOut) packetsIn=\(snapshot.packetsIn) packetsOut=\(snapshot.packetsOut) tcpActive=\(snapshot.tcpActiveSessions) udpActive=\(snapshot.udpActiveSessions) tcpConnectFailures=\(snapshot.tcpConnectFailures) udpAssociateFailures=\(snapshot.udpAssociateFailures) udpTxFailures=\(snapshot.udpTxFailures) dnsRouted=\(snapshot.dnsRoutedCount) parseFailures=\(snapshot.parseFailures) tcpBackpressureDrops=\(snapshot.tcpBackpressureDrops) udpBackpressureDrops=\(snapshot.udpBackpressureDrops) tcpClosedTotal=\(snapshot.tcpSessionCloseTotal) udpClosedTotal=\(snapshot.udpSessionCloseTotal)")
         }
         return DataPlaneStopResult(didStop: true, errorMessage: nil)
     }
@@ -318,14 +167,29 @@ final class PacketFlowDataPlane: TunnelDataPlane {
             tcpConnectFailures: tcpSnapshot.connectFailures,
             tcpSendAttempts: tcpSnapshot.upstreamSendAttempts,
             tcpSendFailures: tcpSnapshot.upstreamSendFailures,
+            tcpBackpressureDrops: tcpSnapshot.backpressureDrops,
             tcpActiveSessions: Int64(tcpSnapshot.activeSessions),
+            tcpSessionCloseTotal: tcpSnapshot.sessionCloseTotal,
+            tcpSessionCloseStateClose: tcpSnapshot.sessionCloseStateClose,
+            tcpSessionCloseSendFailed: tcpSnapshot.sessionCloseSendFailed,
+            tcpSessionCloseRemoteClosed: tcpSnapshot.sessionCloseRemoteClosed,
+            tcpSessionCloseBackpressureDrop: tcpSnapshot.sessionCloseBackpressureDrop,
+            tcpSessionCloseRelayStop: tcpSnapshot.sessionCloseRelayStop,
             udpAssociateAttempts: udpSnapshot.associateAttempts,
             udpAssociateFailures: udpSnapshot.associateFailures,
             udpTxPackets: udpSnapshot.txPackets,
             udpRxPackets: udpSnapshot.rxPackets,
             udpTxFailures: udpSnapshot.txFailures,
+            udpBackpressureDrops: udpSnapshot.backpressureDrops,
             udpActiveSessions: Int64(udpSnapshot.activeSessions),
-            dnsRoutedCount: udpSnapshot.dnsRoutedCount
+            dnsRoutedCount: udpSnapshot.dnsRoutedCount,
+            udpSessionCloseTotal: udpSnapshot.sessionCloseTotal,
+            udpSessionCloseAssociateClosed: udpSnapshot.sessionCloseAssociateClosed,
+            udpSessionCloseAssociateFailed: udpSnapshot.sessionCloseAssociateFailed,
+            udpSessionCloseSendFailed: udpSnapshot.sessionCloseSendFailed,
+            udpSessionCloseBackpressureDrop: udpSnapshot.sessionCloseBackpressureDrop,
+            udpSessionCloseIdleCleanup: udpSnapshot.sessionCloseIdleCleanup,
+            udpSessionCloseRelayStop: udpSnapshot.sessionCloseRelayStop
         )
     }
 
@@ -377,15 +241,34 @@ final class PacketFlowDataPlane: TunnelDataPlane {
 
         case let .upstreamData(flowKey, data):
             guard let session = sessionRegistry.session(for: flowKey), session.hasClientSequence else { return }
-            guard let packet = PacketSynthesizer.synthesizeTCP(
-                flowKey: flowKey,
-                sequenceNumber: session.remoteNextSequence,
-                acknowledgementNumber: session.clientNextSequence,
-                flags: [.ack, .psh],
-                payload: data
-            ) else { return }
+            let chunkSize = Self.downstreamTCPPayloadChunkSize
+            let chunks = data.chunked(maxChunkSize: chunkSize)
+            guard !chunks.isEmpty else { return }
+            if chunks.count > 1 {
+                logHandler?(
+                    "TCP downstream segmentation flow=\(format(flowKey: flowKey)) bytes=\(data.count) chunks=\(chunks.count) chunkSize=\(chunkSize)"
+                )
+            }
+
+            var sequence = session.remoteNextSequence
+
+            for index in chunks.indices {
+                let isLast = index == chunks.count - 1
+                let flags: TCPFlags = isLast ? [.ack, .psh] : [.ack]
+                guard let packet = PacketSynthesizer.synthesizeTCP(
+                    flowKey: flowKey,
+                    sequenceNumber: sequence,
+                    acknowledgementNumber: session.clientNextSequence,
+                    flags: flags,
+                    payload: chunks[index]
+                ) else {
+                    return
+                }
+                writeSynthesizedPackets([packet])
+                sequence = sequence &+ UInt32(chunks[index].count)
+            }
+
             session.consumeRemoteSequence(bytes: data.count)
-            writeSynthesizedPackets([packet])
 
         case let .upstreamClosed(flowKey, hadError):
             guard let session = sessionRegistry.session(for: flowKey), session.hasClientSequence else { return }
@@ -435,6 +318,10 @@ final class PacketFlowDataPlane: TunnelDataPlane {
         }
     }
 
+    private func format(flowKey: TCPFlowKey) -> String {
+        "\(flowKey.sourceAddress):\(flowKey.sourcePort)->\(flowKey.destinationAddress):\(flowKey.destinationPort)"
+    }
+
     private func scheduleSummaryTimer() {
         cancelSummaryTimer()
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "com.uvays.FlowGuard.packetflow.summary"))
@@ -443,7 +330,7 @@ final class PacketFlowDataPlane: TunnelDataPlane {
             guard let self, self.isRunning else { return }
             guard let snapshot = self.collectTrafficSnapshot() else { return }
             self.logHandler?(
-                "PacketFlow summary mode=\(self.mode.rawValue) bytesIn=\(snapshot.bytesIn) bytesOut=\(snapshot.bytesOut) packetsIn=\(snapshot.packetsIn) packetsOut=\(snapshot.packetsOut) tcpActive=\(snapshot.tcpActiveSessions) udpActive=\(snapshot.udpActiveSessions) tcpConnectFailures=\(snapshot.tcpConnectFailures) udpAssociateFailures=\(snapshot.udpAssociateFailures) udpTxFailures=\(snapshot.udpTxFailures) dnsRouted=\(snapshot.dnsRoutedCount) parseFailures=\(snapshot.parseFailures)"
+                "PacketFlow summary mode=\(self.mode.rawValue) bytesIn=\(snapshot.bytesIn) bytesOut=\(snapshot.bytesOut) packetsIn=\(snapshot.packetsIn) packetsOut=\(snapshot.packetsOut) tcpActive=\(snapshot.tcpActiveSessions) udpActive=\(snapshot.udpActiveSessions) tcpConnectFailures=\(snapshot.tcpConnectFailures) udpAssociateFailures=\(snapshot.udpAssociateFailures) udpTxFailures=\(snapshot.udpTxFailures) dnsRouted=\(snapshot.dnsRoutedCount) parseFailures=\(snapshot.parseFailures) tcpBackpressureDrops=\(snapshot.tcpBackpressureDrops) udpBackpressureDrops=\(snapshot.udpBackpressureDrops) tcpClosedTotal=\(snapshot.tcpSessionCloseTotal) udpClosedTotal=\(snapshot.udpSessionCloseTotal)"
             )
         }
         summaryTimer = timer
@@ -461,5 +348,23 @@ private extension NSLock {
         lock()
         defer { unlock() }
         return body()
+    }
+}
+
+private extension Data {
+    func chunked(maxChunkSize: Int) -> [Data] {
+        guard maxChunkSize > 0 else { return [self] }
+        guard count > maxChunkSize else { return [self] }
+
+        var result: [Data] = []
+        result.reserveCapacity((count + maxChunkSize - 1) / maxChunkSize)
+
+        var offset = startIndex
+        while offset < endIndex {
+            let nextOffset = index(offset, offsetBy: maxChunkSize, limitedBy: endIndex) ?? endIndex
+            result.append(self[offset..<nextOffset])
+            offset = nextOffset
+        }
+        return result
     }
 }

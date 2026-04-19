@@ -1,0 +1,31 @@
+name: Core Stability
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  core-stability:
+    name: Core Stability Gate
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    env:
+      PROJECT: FlowGuard.xcodeproj
+      SCHEME: FlowGuardCoreTests
+      CONFIGURATION: Debug
+      DESTINATION: platform=iOS Simulator,OS=latest,name=iPhone 16
+      REPEAT: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Xcode Version
+        run: xcodebuild -version
+
+      - name: Available iOS Simulators
+        run: xcrun simctl list devices available
+
+      - name: Run Core Stability Check
+        run: bash ./scripts/core-stability-check.sh

@@ -1,5 +1,13 @@
 import Foundation
 
+private enum TCPSessionCloseReason: String {
+    case stateClose = "state-close"
+    case sendFailed = "send-failed"
+    case remoteClosed = "remote-closed"
+    case backpressureDrop = "backpressure-drop"
+    case relayStop = "relay-stop"
+}
+
 enum PacketFlowTCPRelayEvent: Sendable {
     case connected(flowKey: TCPFlowKey)
     case connectFailed(flowKey: TCPFlowKey)
@@ -20,12 +28,19 @@ struct PacketFlowTCPRelaySnapshot: Sendable {
     let upstreamSendAttempts: Int64
     let upstreamSendFailures: Int64
     let malformedPackets: Int64
+    let backpressureDrops: Int64
+    let sessionCloseTotal: Int64
+    let sessionCloseStateClose: Int64
+    let sessionCloseSendFailed: Int64
+    let sessionCloseRemoteClosed: Int64
+    let sessionCloseBackpressureDrop: Int64
+    let sessionCloseRelayStop: Int64
 }
 
 final class PacketFlowTCPRelay {
     private let queue = DispatchQueue(label: "com.uvays.FlowGuard.packetflow.tcp-relay")
     private let sessionRegistry: PacketFlowSessionRegistry
-    private let connector: SOCKS5TCPConnector
+    private let connector: any SOCKS5TCPConnecting
 
     private var running = false
     private var socksPort: Int = 1080
@@ -38,12 +53,19 @@ final class PacketFlowTCPRelay {
     private var upstreamSendAttempts: Int64 = 0
     private var upstreamSendFailures: Int64 = 0
     private var malformedPackets: Int64 = 0
+    private var backpressureDrops: Int64 = 0
+    private var sessionCloseTotal: Int64 = 0
+    private var sessionCloseStateClose: Int64 = 0
+    private var sessionCloseSendFailed: Int64 = 0
+    private var sessionCloseRemoteClosed: Int64 = 0
+    private var sessionCloseBackpressureDrop: Int64 = 0
+    private var sessionCloseRelayStop: Int64 = 0
     private var recentlyClosed: [TCPFlowKey: Date] = [:]
     private var eventHandler: ((PacketFlowTCPRelayEvent) -> Void)?
 
     init(
         sessionRegistry: PacketFlowSessionRegistry,
-        connector: SOCKS5TCPConnector = SOCKS5TCPConnector()
+        connector: any SOCKS5TCPConnecting = SOCKS5TCPConnector()
     ) {
         self.sessionRegistry = sessionRegistry
         self.connector = connector
@@ -67,6 +89,13 @@ final class PacketFlowTCPRelay {
             upstreamSendAttempts = 0
             upstreamSendFailures = 0
             malformedPackets = 0
+            backpressureDrops = 0
+            sessionCloseTotal = 0
+            sessionCloseStateClose = 0
+            sessionCloseSendFailed = 0
+            sessionCloseRemoteClosed = 0
+            sessionCloseBackpressureDrop = 0
+            sessionCloseRelayStop = 0
             recentlyClosed.removeAll()
             log("PacketFlowTCPRelay started on upstream SOCKS 127.0.0.1:\(profile.socksPort)")
         }
@@ -77,6 +106,9 @@ final class PacketFlowTCPRelay {
             guard running else { return }
             running = false
             let removed = sessionRegistry.removeAllSessions { $0.closeStream() }
+            if removed > 0 {
+                recordClose(.relayStop, amount: Int64(removed))
+            }
             logHandler?("PacketFlowTCPRelay stopped; removedSessions=\(removed)")
             eventHandler = nil
             logHandler = nil
@@ -94,7 +126,14 @@ final class PacketFlowTCPRelay {
                 downstreamBytesReceived: downstreamBytesReceived,
                 upstreamSendAttempts: upstreamSendAttempts,
                 upstreamSendFailures: upstreamSendFailures,
-                malformedPackets: malformedPackets
+                malformedPackets: malformedPackets,
+                backpressureDrops: backpressureDrops,
+                sessionCloseTotal: sessionCloseTotal,
+                sessionCloseStateClose: sessionCloseStateClose,
+                sessionCloseSendFailed: sessionCloseSendFailed,
+                sessionCloseRemoteClosed: sessionCloseRemoteClosed,
+                sessionCloseBackpressureDrop: sessionCloseBackpressureDrop,
+                sessionCloseRelayStop: sessionCloseRelayStop
             )
         }
     }
@@ -155,8 +194,9 @@ final class PacketFlowTCPRelay {
                 flushBufferedPayloadIfPossible(session)
             case .dropped:
                 droppedPayloadChunks += 1
+                backpressureDrops += 1
                 logHandler?("TCP upstream payload dropped by backpressure \(format(flowKey: session.key)); closing session")
-                closeSession(session, reason: "backpressure-drop")
+                closeSession(session, reason: .backpressureDrop)
             }
         }
     }
@@ -169,7 +209,7 @@ final class PacketFlowTCPRelay {
             case .flushBufferedPayload:
                 flushBufferedPayloadIfPossible(session)
             case .closeConnection:
-                closeSession(session, reason: "state-close")
+                closeSession(session, reason: .stateClose)
             case .none:
                 continue
             }
@@ -226,7 +266,7 @@ final class PacketFlowTCPRelay {
                                 let closeTransition = activeSession.apply(.remoteClosed)
                                 self.handleActions(closeTransition.actions, session: activeSession)
                                 if case .closed = activeSession.state {
-                                    self.closeSession(activeSession, reason: "remote-closed")
+                                    self.closeSession(activeSession, reason: .remoteClosed)
                                 }
                             }
                         }
@@ -257,7 +297,7 @@ final class PacketFlowTCPRelay {
                     if let error {
                         self.upstreamSendFailures += 1
                         self.logHandler?("TCP upstream send failed \(self.format(flowKey: session.key)): \(error.localizedDescription)")
-                        self.closeSession(session, reason: "send-failed")
+                        self.closeSession(session, reason: .sendFailed)
                         return
                     }
                     self.upstreamBytesSent += Int64(chunk.count)
@@ -266,12 +306,32 @@ final class PacketFlowTCPRelay {
         }
     }
 
-    private func closeSession(_ session: PacketFlowTCPSession, reason: String) {
+    private func closeSession(_ session: PacketFlowTCPSession, reason: TCPSessionCloseReason) {
         session.closeStream()
-        sessionRegistry.removeSession(for: session.key)
+        guard sessionRegistry.removeSession(for: session.key) else {
+            return
+        }
+        recordClose(reason)
         recentlyClosed[session.key] = Date()
         trimRecentlyClosed()
-        logHandler?("TCP session closed \(format(flowKey: session.key)); reason=\(reason)")
+        logHandler?("TCP session closed \(format(flowKey: session.key)); reason=\(reason.rawValue)")
+    }
+
+    private func recordClose(_ reason: TCPSessionCloseReason, amount: Int64 = 1) {
+        guard amount > 0 else { return }
+        sessionCloseTotal += amount
+        switch reason {
+        case .stateClose:
+            sessionCloseStateClose += amount
+        case .sendFailed:
+            sessionCloseSendFailed += amount
+        case .remoteClosed:
+            sessionCloseRemoteClosed += amount
+        case .backpressureDrop:
+            sessionCloseBackpressureDrop += amount
+        case .relayStop:
+            sessionCloseRelayStop += amount
+        }
     }
 
     private func shouldIgnoreRecentlyClosedPacket(_ packet: TCPPacket) -> Bool {

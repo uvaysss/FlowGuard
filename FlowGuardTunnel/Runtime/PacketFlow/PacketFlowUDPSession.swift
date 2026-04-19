@@ -14,7 +14,7 @@ final class PacketFlowUDPSession {
     let createdAt: Date
     private(set) var lastSeenAt: Date
     private(set) var state: PacketFlowUDPSessionState
-    private(set) var association: SOCKS5UDPAssociation?
+    private(set) var association: (any SOCKS5UDPAssociationing)?
     private let queue: BoundedDatagramQueue
 
     init(key: UDPFlowKey, now: Date = Date(), maxBufferedBytes: Int = 256 * 1024) {
@@ -44,7 +44,7 @@ final class PacketFlowUDPSession {
         return queue.drain()
     }
 
-    func attachAssociation(_ association: SOCKS5UDPAssociation) {
+    func attachAssociation(_ association: any SOCKS5UDPAssociationing) {
         self.association = association
         setState(.ready)
     }

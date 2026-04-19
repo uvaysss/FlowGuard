@@ -1,5 +1,4 @@
 import Foundation
-import NetworkExtension
 
 struct SynthesizedPacket: Sendable {
     let data: Data
@@ -15,7 +14,7 @@ struct PacketFlowEgressWriterSnapshot: Sendable {
 
 final class PacketFlowEgressWriter {
     private let queue = DispatchQueue(label: "com.uvays.FlowGuard.packetflow.egress-writer")
-    private weak var flow: NEPacketTunnelFlow?
+    private weak var flow: (any PacketFlowIO)?
     private var logHandler: ((String) -> Void)?
 
     private var writeCalls: Int64 = 0
@@ -23,7 +22,7 @@ final class PacketFlowEgressWriter {
     private var bytesWritten: Int64 = 0
     private var droppedPackets: Int64 = 0
 
-    func start(flow: NEPacketTunnelFlow?, log: @escaping (String) -> Void) {
+    func start(flow: (any PacketFlowIO)?, log: @escaping (String) -> Void) {
         queue.sync {
             self.flow = flow
             self.logHandler = log
@@ -61,7 +60,7 @@ final class PacketFlowEgressWriter {
             self.packetsWritten += Int64(payloads.count)
             let bytes = payloads.reduce(into: 0) { $0 += $1.count }
             self.bytesWritten += Int64(bytes)
-            flow.writePackets(payloads, withProtocols: protocols)
+            _ = flow.writePacketBatch(payloads, protocols: protocols)
             onWrite?(payloads.count, bytes)
         }
     }

@@ -1,5 +1,14 @@
 import Foundation
 
+private enum UDPSessionCloseReason: String {
+    case associateClosed = "associate-closed"
+    case associateFailed = "associate-failed"
+    case sendFailed = "send-failed"
+    case backpressureDrop = "backpressure-drop"
+    case idleCleanup = "idle-cleanup"
+    case relayStop = "relay-stop"
+}
+
 enum PacketFlowUDPRelayEvent: Sendable {
     case upstreamDatagram(flowKey: UDPFlowKey, payload: Data)
 }
@@ -16,11 +25,21 @@ struct PacketFlowUDPRelaySnapshot: Sendable {
     let dnsRoutedCount: Int64
     let txFailures: Int64
     let malformedPackets: Int64
+    let backpressureDrops: Int64
+    let sessionCloseTotal: Int64
+    let sessionCloseAssociateClosed: Int64
+    let sessionCloseAssociateFailed: Int64
+    let sessionCloseSendFailed: Int64
+    let sessionCloseBackpressureDrop: Int64
+    let sessionCloseIdleCleanup: Int64
+    let sessionCloseRelayStop: Int64
 }
 
 final class PacketFlowUDPRelay {
     private let queue = DispatchQueue(label: "com.uvays.FlowGuard.packetflow.udp-relay")
-    private let associateClient: SOCKS5UDPAssociateClient
+    private let associateClient: any SOCKS5UDPAssociating
+    private let nowProvider: () -> Date
+    private let idleSessionMaxAge: TimeInterval
 
     private var running = false
     private var socksPort: Int = 1080
@@ -38,10 +57,25 @@ final class PacketFlowUDPRelay {
     private var dnsRoutedCount: Int64 = 0
     private var txFailures: Int64 = 0
     private var malformedCount: Int64 = 0
+    private var backpressureDrops: Int64 = 0
+    private var sessionCloseTotal: Int64 = 0
+    private var sessionCloseAssociateClosed: Int64 = 0
+    private var sessionCloseAssociateFailed: Int64 = 0
+    private var sessionCloseSendFailed: Int64 = 0
+    private var sessionCloseBackpressureDrop: Int64 = 0
+    private var sessionCloseIdleCleanup: Int64 = 0
+    private var sessionCloseRelayStop: Int64 = 0
     private var eventHandler: ((PacketFlowUDPRelayEvent) -> Void)?
+    private var blockedNonDNSFlows: Set<UDPFlowKey> = []
 
-    init(associateClient: SOCKS5UDPAssociateClient = SOCKS5UDPAssociateClient()) {
+    init(
+        associateClient: any SOCKS5UDPAssociating = SOCKS5UDPAssociateClient(),
+        now: @escaping () -> Date = Date.init,
+        idleSessionMaxAge: TimeInterval = 90
+    ) {
         self.associateClient = associateClient
+        self.nowProvider = now
+        self.idleSessionMaxAge = idleSessionMaxAge
     }
 
     func start(
@@ -65,6 +99,15 @@ final class PacketFlowUDPRelay {
             dnsRoutedCount = 0
             txFailures = 0
             malformedCount = 0
+            backpressureDrops = 0
+            sessionCloseTotal = 0
+            sessionCloseAssociateClosed = 0
+            sessionCloseAssociateFailed = 0
+            sessionCloseSendFailed = 0
+            sessionCloseBackpressureDrop = 0
+            sessionCloseIdleCleanup = 0
+            sessionCloseRelayStop = 0
+            blockedNonDNSFlows.removeAll()
             eventHandler = onEvent
             log("PacketFlowUDPRelay started on upstream SOCKS 127.0.0.1:\(profile.socksPort) dnsMode=\(profile.dnsMode.rawValue)")
         }
@@ -77,6 +120,9 @@ final class PacketFlowUDPRelay {
             let count = sessions.count
             for session in sessions.values {
                 session.close()
+            }
+            if count > 0 {
+                recordClose(.relayStop, amount: Int64(count))
             }
             sessions.removeAll()
             logHandler?("PacketFlowUDPRelay stopped; removedSessions=\(count)")
@@ -98,7 +144,15 @@ final class PacketFlowUDPRelay {
                 rxBytes: rxBytes,
                 dnsRoutedCount: dnsRoutedCount,
                 txFailures: txFailures,
-                malformedPackets: malformedCount
+                malformedPackets: malformedCount,
+                backpressureDrops: backpressureDrops,
+                sessionCloseTotal: sessionCloseTotal,
+                sessionCloseAssociateClosed: sessionCloseAssociateClosed,
+                sessionCloseAssociateFailed: sessionCloseAssociateFailed,
+                sessionCloseSendFailed: sessionCloseSendFailed,
+                sessionCloseBackpressureDrop: sessionCloseBackpressureDrop,
+                sessionCloseIdleCleanup: sessionCloseIdleCleanup,
+                sessionCloseRelayStop: sessionCloseRelayStop
             )
         }
     }
@@ -116,11 +170,20 @@ final class PacketFlowUDPRelay {
                     }
                 }
             }
-            self.cleanupIdleSessions(now: Date(), maxIdle: 90)
+            self.cleanupIdleSessions(now: self.nowProvider(), maxIdle: self.idleSessionMaxAge)
         }
     }
 
     private func handleUDPPacket(_ packet: UDPPacket) {
+        // Temporary reliability guard: route only DNS over UDP.
+        // QUIC/non-DNS UDP can cause partial page load with the current UDP relay path.
+        guard packet.flowKey.destinationPort == 53 else {
+            if blockedNonDNSFlows.insert(packet.flowKey).inserted {
+                logHandler?("UDP non-DNS flow blocked (force TCP fallback) \(format(flowKey: packet.flowKey))")
+            }
+            return
+        }
+
         let session = upsertSession(for: packet.flowKey)
         session.touch()
 
@@ -141,8 +204,9 @@ final class PacketFlowUDPRelay {
             flushQueuedDatagrams(session)
         case .dropped:
             droppedDatagrams += 1
+            backpressureDrops += 1
             logHandler?("UDP datagram dropped by backpressure \(format(flowKey: packet.flowKey)); closing session")
-            closeSession(session, reason: "backpressure-drop")
+            closeSession(session, reason: .backpressureDrop)
         }
     }
 
@@ -192,7 +256,7 @@ final class PacketFlowUDPRelay {
                                 if let error {
                                     self.logHandler?("UDP association closed with error \(self.format(flowKey: key)): \(error.localizedDescription)")
                                 }
-                                self.closeSession(current, reason: "associate-closed")
+                                self.closeSession(current, reason: .associateClosed)
                             }
                         }
                     )
@@ -201,7 +265,7 @@ final class PacketFlowUDPRelay {
                     self.associateFailures += 1
                     liveSession.setState(.failed(error.localizedDescription))
                     self.logHandler?("UDP ASSOCIATE failed \(self.format(flowKey: key)): \(error.localizedDescription)")
-                    self.closeSession(liveSession, reason: "associate-failed")
+                    self.closeSession(liveSession, reason: .associateFailed)
                 }
             }
         }
@@ -230,7 +294,7 @@ final class PacketFlowUDPRelay {
                     if let error {
                         self.txFailures += 1
                         self.logHandler?("UDP send failed \(self.format(flowKey: session.key)): \(error.localizedDescription)")
-                        self.closeSession(session, reason: "send-failed")
+                        self.closeSession(session, reason: .sendFailed)
                         return
                     }
                     self.txPackets += 1
@@ -240,10 +304,13 @@ final class PacketFlowUDPRelay {
         }
     }
 
-    private func closeSession(_ session: PacketFlowUDPSession, reason: String) {
+    private func closeSession(_ session: PacketFlowUDPSession, reason: UDPSessionCloseReason) {
         session.close()
-        sessions.removeValue(forKey: session.key)
-        logHandler?("UDP session closed \(format(flowKey: session.key)); reason=\(reason)")
+        guard sessions.removeValue(forKey: session.key) != nil else {
+            return
+        }
+        recordClose(reason)
+        logHandler?("UDP session closed \(format(flowKey: session.key)); reason=\(reason.rawValue)")
     }
 
     private func upsertSession(for key: UDPFlowKey) -> PacketFlowUDPSession {
@@ -264,9 +331,30 @@ final class PacketFlowUDPRelay {
         }
         if !keysToRemove.isEmpty {
             for key in keysToRemove {
-                sessions.removeValue(forKey: key)
+                if sessions.removeValue(forKey: key) != nil {
+                    recordClose(.idleCleanup)
+                }
             }
             logHandler?("UDP idle cleanup removed \(keysToRemove.count) sessions")
+        }
+    }
+
+    private func recordClose(_ reason: UDPSessionCloseReason, amount: Int64 = 1) {
+        guard amount > 0 else { return }
+        sessionCloseTotal += amount
+        switch reason {
+        case .associateClosed:
+            sessionCloseAssociateClosed += amount
+        case .associateFailed:
+            sessionCloseAssociateFailed += amount
+        case .sendFailed:
+            sessionCloseSendFailed += amount
+        case .backpressureDrop:
+            sessionCloseBackpressureDrop += amount
+        case .idleCleanup:
+            sessionCloseIdleCleanup += amount
+        case .relayStop:
+            sessionCloseRelayStop += amount
         }
     }
 

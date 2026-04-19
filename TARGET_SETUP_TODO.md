@@ -39,4 +39,4 @@ Source files and scaffolding are in place, but Xcode target wiring still needs t
 - `xcodebuild` cannot be used in this environment until full Xcode is selected (`xcode-select` currently points to Command Line Tools).
 - Runtime now expects Rumble-like startup option keys from app to extension:
   - `Args`, `IPv6`, `DNSServer`, `SOCKSPort`
-- Runtime now expects UTUN fd resolution at provider startup and uses Rumble-style network settings (`198.18.0.1/16`, MTU `9000`, optional IPv6 default route).
+- Runtime uses packet-flow startup with Rumble-style network settings (`198.18.0.1/16`, MTU `9000`, optional IPv6 default route).

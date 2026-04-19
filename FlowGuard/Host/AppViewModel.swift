@@ -6,6 +6,7 @@ import SwiftUI
 @MainActor
 final class AppViewModel: ObservableObject {
     private static let statsPollingIntervalNanoseconds: UInt64 = 2_000_000_000
+    private static let connectionPollingIntervalNanoseconds: UInt64 = 1_000_000_000
 
     @Published var profile: TunnelProfile = .default
     @Published var providerState: ProviderState = .disconnected
@@ -19,6 +20,8 @@ final class AppViewModel: ObservableObject {
     private let snapshotStore: RuntimeSnapshotStore
     private let logStore: RuntimeLogStore
     private var statsPollingTask: Task<Void, Never>?
+    private var connectionPollingTask: Task<Void, Never>?
+    private var isConnectInFlight = false
 
     init(
         controller: TunnelController? = nil,
@@ -36,6 +39,12 @@ final class AppViewModel: ObservableObject {
         Task { [weak self] in
             await self?.reconcileProviderStateWithSystem()
         }
+        startConnectionPolling()
+    }
+
+    deinit {
+        statsPollingTask?.cancel()
+        connectionPollingTask?.cancel()
     }
 
     func loadProfileFromDisk() {
@@ -70,24 +79,40 @@ final class AppViewModel: ObservableObject {
     }
 
     func connect() {
-        providerState = .starting
+        guard !isBusy else {
+            return
+        }
+
+        isBusy = true
+        isConnectInFlight = true
+        applyProviderState(.starting)
         startStatsPolling()
-        runBusyTask { [self] in
-            try await self.controller.connect()
-            if self.providerState == .starting {
-                self.providerState = .running
+        Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.isConnectInFlight = false
+                self.isBusy = false
             }
-            self.statusMessage = "Tunnel start requested."
-            await self.requestStats()
+
+            do {
+                try await self.controller.connect()
+                self.applyProviderState(.running)
+                self.statusMessage = "Tunnel start requested."
+                await self.requestStats()
+            } catch {
+                self.stopStatsPolling()
+                self.statusMessage = error.localizedDescription
+                await self.reconcileProviderStateWithSystem()
+            }
         }
     }
 
     func disconnect() {
-        providerState = .stopping
+        applyProviderState(.stopping)
         runBusyTask { [self] in
             try await self.controller.disconnect()
             self.stopStatsPolling()
-            self.providerState = .disconnected
+            self.applyProviderState(.disconnected)
             self.statusMessage = "Tunnel stop request sent."
             self.loadSnapshotFromDisk()
         }
@@ -98,9 +123,9 @@ final class AppViewModel: ObservableObject {
             let response = try await controller.requestStats()
             runtimeStats = response.stats
             if let liveState = response.state {
-                providerState = liveState
+                applyProviderState(liveState)
             } else if let snapshot = try? snapshotStore.loadRuntimeSnapshot() {
-                providerState = snapshot.state
+                applyProviderState(snapshot.state)
             }
             if statusMessage.hasPrefix("Stats request failed") {
                 statusMessage = "Stats updated."
@@ -142,7 +167,7 @@ final class AppViewModel: ObservableObject {
         guard let snapshot = try? snapshotStore.loadRuntimeSnapshot() else {
             return
         }
-        providerState = snapshot.state
+        applyProviderState(snapshot.state)
         runtimeStats = snapshot.stats
     }
 
@@ -157,7 +182,6 @@ final class AppViewModel: ObservableObject {
             do {
                 try await operation()
             } catch {
-                stopStatsPolling()
                 statusMessage = error.localizedDescription
                 await reconcileProviderStateWithSystem()
             }
@@ -180,14 +204,46 @@ final class AppViewModel: ObservableObject {
         statsPollingTask = nil
     }
 
+    private func startConnectionPolling() {
+        connectionPollingTask?.cancel()
+        connectionPollingTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { break }
+                await self.reconcileProviderStateWithSystem()
+                try? await Task.sleep(nanoseconds: Self.connectionPollingIntervalNanoseconds)
+            }
+        }
+    }
+
     private func reconcileProviderStateWithSystem() async {
         guard let status = try? await controller.connectionStatus() else {
             return
         }
 
         let resolved = ProviderState(vpnStatus: status)
-        if resolved != providerState {
-            providerState = resolved
+        applyProviderState(resolved)
+
+        switch resolved {
+        case .starting, .running:
+            if statsPollingTask == nil {
+                startStatsPolling()
+            }
+        case .disconnected:
+            stopStatsPolling()
+        case .stopping, .failed:
+            break
+        }
+    }
+
+    private func applyProviderState(_ next: ProviderState) {
+        if isConnectInFlight && next == .disconnected {
+            return
+        }
+        if providerState == .running && next == .starting {
+            return
+        }
+        if providerState != next {
+            providerState = next
         }
     }
 }

@@ -165,6 +165,14 @@ private extension ByeDPIPreset {
             return "Aggressive"
         case .forYoutube:
             return "For Youtube"
+        case .strategyBasicTorst:
+            return "Strategy: Basic (torst)"
+        case .strategyYoutubeStable:
+            return "Strategy: YouTube Stable"
+        case .strategyLinuxFakeMD5:
+            return "Strategy: Linux fake+md5"
+        case .strategyWindowsSplitFake:
+            return "Strategy: Windows split+fake"
         }
     }
 }

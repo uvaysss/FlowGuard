@@ -1,6 +1,21 @@
 import Foundation
 import Network
 
+protocol SOCKS5TCPStreaming: AnyObject {
+    func send(_ data: Data, completion: @escaping (Error?) -> Void)
+    func receiveLoop(onData: @escaping (Data) -> Void, onComplete: @escaping (Error?) -> Void)
+    func cancel()
+}
+
+protocol SOCKS5TCPConnecting {
+    func connect(
+        socksPort: Int,
+        destinationHost: String,
+        destinationPort: UInt16,
+        completion: @escaping (Result<any SOCKS5TCPStreaming, Error>) -> Void
+    )
+}
+
 enum SOCKS5ConnectorError: LocalizedError {
     case invalidDestination
     case handshakeFailed(String)
@@ -42,7 +57,7 @@ final class SOCKS5TCPStream {
     }
 
     private func receiveNext(onData: @escaping (Data) -> Void, onComplete: @escaping (Error?) -> Void) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 16 * 1024) { [weak self] data, _, isComplete, error in
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 4 * 1024) { [weak self] data, _, isComplete, error in
             if let error {
                 onComplete(error)
                 return
@@ -59,18 +74,33 @@ final class SOCKS5TCPStream {
     }
 }
 
-final class SOCKS5TCPConnector {
+extension SOCKS5TCPStream: SOCKS5TCPStreaming {}
+
+final class SOCKS5TCPConnector: SOCKS5TCPConnecting {
     private let queue = DispatchQueue(label: "com.uvays.FlowGuard.packetflow.socks5")
 
     func connect(
         socksPort: Int,
         destinationHost: String,
         destinationPort: UInt16,
-        completion: @escaping (Result<SOCKS5TCPStream, Error>) -> Void
+        completion: @escaping (Result<any SOCKS5TCPStreaming, Error>) -> Void
     ) {
+        let completionLock = NSLock()
+        var didComplete = false
+        let finish: (Result<any SOCKS5TCPStreaming, Error>) -> Void = { result in
+            completionLock.lock()
+            let shouldComplete = !didComplete
+            if shouldComplete {
+                didComplete = true
+            }
+            completionLock.unlock()
+            guard shouldComplete else { return }
+            completion(result)
+        }
+
         let endpointHost = NWEndpoint.Host("127.0.0.1")
         guard let endpointPort = NWEndpoint.Port(rawValue: UInt16(socksPort)) else {
-            completion(.failure(SOCKS5ConnectorError.connectionFailed("Invalid SOCKS port")))
+            finish(.failure(SOCKS5ConnectorError.connectionFailed("Invalid SOCKS port")))
             return
         }
 
@@ -82,12 +112,12 @@ final class SOCKS5TCPConnector {
                     connection: connection,
                     destinationHost: destinationHost,
                     destinationPort: destinationPort,
-                    completion: completion
+                    completion: finish
                 )
             case let .failed(error):
-                completion(.failure(SOCKS5ConnectorError.connectionFailed(error.localizedDescription)))
+                finish(.failure(SOCKS5ConnectorError.connectionFailed(error.localizedDescription)))
             case .cancelled:
-                completion(.failure(SOCKS5ConnectorError.connectionFailed("Connection cancelled")))
+                finish(.failure(SOCKS5ConnectorError.connectionFailed("Connection cancelled")))
             default:
                 break
             }
@@ -100,19 +130,22 @@ final class SOCKS5TCPConnector {
         connection: NWConnection,
         destinationHost: String,
         destinationPort: UInt16,
-        completion: @escaping (Result<SOCKS5TCPStream, Error>) -> Void
+        completion: @escaping (Result<any SOCKS5TCPStreaming, Error>) -> Void
     ) {
         connection.send(content: Data([0x05, 0x01, 0x00]), completion: .contentProcessed { error in
             if let error {
+                connection.cancel()
                 completion(.failure(error))
                 return
             }
             self.receiveExact(connection: connection, length: 2) { result in
                 switch result {
                 case let .failure(error):
+                    connection.cancel()
                     completion(.failure(error))
                 case let .success(response):
                     guard response.count == 2, response[0] == 0x05, response[1] == 0x00 else {
+                        connection.cancel()
                         completion(.failure(SOCKS5ConnectorError.handshakeFailed("Method negotiation rejected")))
                         return
                     }
@@ -131,15 +164,17 @@ final class SOCKS5TCPConnector {
         connection: NWConnection,
         destinationHost: String,
         destinationPort: UInt16,
-        completion: @escaping (Result<SOCKS5TCPStream, Error>) -> Void
+        completion: @escaping (Result<any SOCKS5TCPStreaming, Error>) -> Void
     ) {
         guard let request = buildConnectRequest(host: destinationHost, port: destinationPort) else {
+            connection.cancel()
             completion(.failure(SOCKS5ConnectorError.invalidDestination))
             return
         }
 
         connection.send(content: request, completion: .contentProcessed { error in
             if let error {
+                connection.cancel()
                 completion(.failure(error))
                 return
             }
@@ -147,13 +182,16 @@ final class SOCKS5TCPConnector {
             self.receiveExact(connection: connection, length: 4) { headerResult in
                 switch headerResult {
                 case let .failure(error):
+                    connection.cancel()
                     completion(.failure(error))
                 case let .success(header):
                     guard header.count == 4, header[0] == 0x05 else {
+                        connection.cancel()
                         completion(.failure(SOCKS5ConnectorError.handshakeFailed("Invalid CONNECT response header")))
                         return
                     }
                     guard header[1] == 0x00 else {
+                        connection.cancel()
                         completion(.failure(SOCKS5ConnectorError.handshakeFailed("CONNECT failed with code \(header[1])")))
                         return
                     }

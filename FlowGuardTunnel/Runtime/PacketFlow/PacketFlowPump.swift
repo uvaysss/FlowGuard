@@ -1,5 +1,4 @@
 import Foundation
-import NetworkExtension
 
 struct PacketFlowPumpSnapshot: Sendable {
     let ingressPackets: Int64
@@ -12,7 +11,7 @@ struct PacketFlowPumpSnapshot: Sendable {
 final class PacketFlowPump {
     private let queue = DispatchQueue(label: "com.uvays.FlowGuard.packetflow.pump")
     private var running = false
-    private var sourceFlow: NEPacketTunnelFlow?
+    private var sourceFlow: (any PacketFlowIO)?
     private var logHandler: ((String) -> Void)?
     private var summaryTimer: DispatchSourceTimer?
     private var ingressHandler: (([Data]) -> Void)?
@@ -23,7 +22,7 @@ final class PacketFlowPump {
     private var parseFailures: Int64 = 0
 
     func start(
-        flow: NEPacketTunnelFlow?,
+        flow: (any PacketFlowIO)?,
         log: @escaping (String) -> Void,
         onIngressPackets: (([Data]) -> Void)? = nil
     ) {
@@ -75,9 +74,9 @@ final class PacketFlowPump {
         }
     }
 
-    private func scheduleReadLocked(flow: NEPacketTunnelFlow) {
+    private func scheduleReadLocked(flow: any PacketFlowIO) {
         guard running else { return }
-        flow.readPackets { [weak self] packets, _ in
+        flow.readPacketBatch { [weak self] packets, _ in
             guard let self else { return }
             self.queue.async {
                 guard self.running else { return }

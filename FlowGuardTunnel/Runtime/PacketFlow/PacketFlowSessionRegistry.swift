@@ -20,9 +20,10 @@ final class PacketFlowSessionRegistry {
         }
     }
 
-    func removeSession(for key: TCPFlowKey) {
-        _ = queue.sync(flags: .barrier) {
-            tcpSessions.removeValue(forKey: key)
+    @discardableResult
+    func removeSession(for key: TCPFlowKey) -> Bool {
+        queue.sync(flags: .barrier) {
+            tcpSessions.removeValue(forKey: key) != nil
         }
     }
 
