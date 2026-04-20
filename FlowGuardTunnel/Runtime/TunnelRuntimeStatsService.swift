@@ -10,6 +10,8 @@ final class TunnelRuntimeStatsService {
     func collectStats(now: Date = Date()) -> RuntimeStats {
         var snapshot = runtimeStateStore.withState { $0.runtimeStats }
         let startedAt = runtimeStateStore.withState { $0.startedAt }
+        let implementationMode = runtimeStateStore.withState { $0.implementationMode }
+        snapshot.startupImplementationMode = implementationMode.rawValue
         if let startedAt {
             snapshot.uptimeSeconds = now.timeIntervalSince(startedAt)
         }
@@ -21,7 +23,9 @@ final class TunnelRuntimeStatsService {
         apply(dataPlaneSnapshot, to: &snapshot)
         runtimeStateStore.updateState {
             var runtimeStats = $0.runtimeStats
+            runtimeStats.uptimeSeconds = snapshot.uptimeSeconds
             apply(dataPlaneSnapshot, to: &runtimeStats)
+            runtimeStats.startupImplementationMode = $0.implementationMode.rawValue
             $0.runtimeStats = runtimeStats
         }
         return snapshot
@@ -60,5 +64,11 @@ final class TunnelRuntimeStatsService {
         stats.udpSessionCloseBackpressureDrop = dataPlaneSnapshot.udpSessionCloseBackpressureDrop
         stats.udpSessionCloseIdleCleanup = dataPlaneSnapshot.udpSessionCloseIdleCleanup
         stats.udpSessionCloseRelayStop = dataPlaneSnapshot.udpSessionCloseRelayStop
+        if stats.uptimeSeconds > 0 {
+            let totalBytes = Double(stats.bytesIn + stats.bytesOut)
+            stats.totalThroughputBytesPerSecond = totalBytes / stats.uptimeSeconds
+        } else {
+            stats.totalThroughputBytesPerSecond = nil
+        }
     }
 }

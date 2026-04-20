@@ -66,6 +66,212 @@ protocol TunnelDataPlane: AnyObject {
     func collectTrafficSnapshot() -> DataPlaneTrafficSnapshot?
 }
 
+private enum LegacyTunFDDataPlaneError: LocalizedError {
+    case missingPacketFlow
+    case tunnelDescriptorResolutionFailed(String)
+    case invalidTunnelDescriptor(Int32)
+
+    var errorDescription: String? {
+        switch self {
+        case .missingPacketFlow:
+            return "Packet flow reference is unavailable for TUN descriptor resolution."
+        case let .tunnelDescriptorResolutionFailed(details):
+            return "Failed to resolve tunnel interface file descriptor. \(details)"
+        case let .invalidTunnelDescriptor(fd):
+            return "Resolved tunnel interface descriptor is invalid: \(fd)."
+        }
+    }
+}
+
+final class LegacyTunFDDataPlane: TunnelDataPlane {
+    private let tun2socksEngine: Tun2SocksEngine
+    private let stateLock = NSLock()
+    private var running = false
+    private var trackedInterfaceName: String?
+    private var baselineBytesIn: UInt64 = 0
+    private var baselineBytesOut: UInt64 = 0
+
+    let mode: TunnelImplementationMode
+
+    var isRunning: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return running
+    }
+
+    init(mode: TunnelImplementationMode, tun2socksEngine: Tun2SocksEngine) {
+        self.mode = mode
+        self.tun2socksEngine = tun2socksEngine
+    }
+
+    func start(
+        profile: TunnelProfile,
+        packetFlow: NEPacketTunnelFlow?,
+        onExit: @escaping (Int32) -> Void,
+        log: @escaping (String) -> Void
+    ) throws -> DataPlaneStartResult {
+        guard let packetFlow else {
+            throw LegacyTunFDDataPlaneError.missingPacketFlow
+        }
+
+        let resolveResult = TunFileDescriptorResolver.resolveUTUNFileDescriptorDetailed(
+            from: packetFlow,
+            attempts: 20,
+            retryDelayMicroseconds: 100_000,
+            // iOS internals for NEPacketTunnelFlow can change, making KVC extraction brittle.
+            // Keep speed-first path resilient by falling back to scanning open FDs for utun.
+            debugFallback: .scanOpenFileDescriptors(maxFD: 4096)
+        )
+        guard let tunFD = resolveResult.fileDescriptor else {
+            let details = resolveResult.diagnostics?.failure.description ?? "Unknown descriptor resolution failure."
+            throw LegacyTunFDDataPlaneError.tunnelDescriptorResolutionFailed(details)
+        }
+        guard tunFD >= 0 else {
+            throw LegacyTunFDDataPlaneError.invalidTunnelDescriptor(tunFD)
+        }
+        log("Resolved TUN descriptor: \(tunFD)")
+
+        let interfaceName = TunFileDescriptorResolver.utunInterfaceName(from: tunFD)
+        let counters = interfaceName.flatMap(TunFileDescriptorResolver.interfaceTrafficCounters(interfaceName:))
+        let baselineIn = counters?.bytesIn ?? 0
+        let baselineOut = counters?.bytesOut ?? 0
+        stateLock.lock()
+        trackedInterfaceName = interfaceName
+        baselineBytesIn = baselineIn
+        baselineBytesOut = baselineOut
+        stateLock.unlock()
+
+        if let interfaceName {
+            log("Resolved TUN interface: \(interfaceName)")
+        } else {
+            log("Failed to resolve TUN interface name from descriptor")
+        }
+
+        try tun2socksEngine.start(config: profile, tunFD: tunFD) { [weak self] exitCode in
+            self?.setRunning(false)
+            onExit(exitCode)
+        }
+
+        setRunning(true)
+        log("tun2socks started")
+
+        return DataPlaneStartResult(
+            tunInterfaceName: interfaceName,
+            baselineBytesIn: baselineIn,
+            baselineBytesOut: baselineOut
+        )
+    }
+
+    func stop(
+        context: String,
+        log: @escaping (String) -> Void
+    ) -> DataPlaneStopResult {
+        let gracefulTimeout: TimeInterval = 3
+        let forcedTimeout: TimeInterval = 2
+
+        do {
+            try tun2socksEngine.requestStop()
+            let stopped = tun2socksEngine.waitForExit(timeout: gracefulTimeout)
+            if stopped {
+                setRunning(false)
+                clearInterfaceTracking()
+                log("tun2socks stopped")
+                return DataPlaneStopResult(didStop: true, errorMessage: nil)
+            }
+
+            log("tun2socks did not stop within \(Int(gracefulTimeout))s, forcing shutdown")
+            tun2socksEngine.forceStop()
+            let forceStopped = tun2socksEngine.waitForExit(timeout: forcedTimeout)
+            if forceStopped {
+                setRunning(false)
+                clearInterfaceTracking()
+                log("tun2socks stopped after force-stop")
+                return DataPlaneStopResult(didStop: true, errorMessage: nil)
+            }
+
+            let message = "tun2socks did not exit after force-stop"
+            log(message)
+            return DataPlaneStopResult(didStop: false, errorMessage: "\(context) \(message)")
+        } catch {
+            log("tun2socks stop failed: \(error.localizedDescription)")
+            tun2socksEngine.forceStop()
+            if tun2socksEngine.waitForExit(timeout: forcedTimeout) {
+                setRunning(false)
+                clearInterfaceTracking()
+                log("tun2socks force-stopped after error")
+                return DataPlaneStopResult(didStop: true, errorMessage: nil)
+            }
+
+            let message = "tun2socks did not exit after force-stop following stop error"
+            log(message)
+            return DataPlaneStopResult(didStop: false, errorMessage: "\(context) \(message)")
+        }
+    }
+
+    func collectTrafficSnapshot() -> DataPlaneTrafficSnapshot? {
+        let snapshotState: (String?, UInt64, UInt64)
+        stateLock.lock()
+        snapshotState = (trackedInterfaceName, baselineBytesIn, baselineBytesOut)
+        stateLock.unlock()
+
+        guard let interfaceName = snapshotState.0,
+              let counters = TunFileDescriptorResolver.interfaceTrafficCounters(interfaceName: interfaceName) else {
+            return nil
+        }
+
+        let deltaIn = counters.bytesIn >= snapshotState.1 ? counters.bytesIn - snapshotState.1 : 0
+        let deltaOut = counters.bytesOut >= snapshotState.2 ? counters.bytesOut - snapshotState.2 : 0
+        return DataPlaneTrafficSnapshot(
+            bytesIn: Int64(deltaIn),
+            bytesOut: Int64(deltaOut),
+            packetsIn: 0,
+            packetsOut: 0,
+            parseFailures: 0,
+            tcpConnectAttempts: 0,
+            tcpConnectFailures: 0,
+            tcpSendAttempts: 0,
+            tcpSendFailures: 0,
+            tcpBackpressureDrops: 0,
+            tcpActiveSessions: 0,
+            tcpSessionCloseTotal: 0,
+            tcpSessionCloseStateClose: 0,
+            tcpSessionCloseSendFailed: 0,
+            tcpSessionCloseRemoteClosed: 0,
+            tcpSessionCloseBackpressureDrop: 0,
+            tcpSessionCloseRelayStop: 0,
+            udpAssociateAttempts: 0,
+            udpAssociateFailures: 0,
+            udpTxPackets: 0,
+            udpRxPackets: 0,
+            udpTxFailures: 0,
+            udpBackpressureDrops: 0,
+            udpActiveSessions: 0,
+            dnsRoutedCount: 0,
+            udpSessionCloseTotal: 0,
+            udpSessionCloseAssociateClosed: 0,
+            udpSessionCloseAssociateFailed: 0,
+            udpSessionCloseSendFailed: 0,
+            udpSessionCloseBackpressureDrop: 0,
+            udpSessionCloseIdleCleanup: 0,
+            udpSessionCloseRelayStop: 0
+        )
+    }
+
+    private func setRunning(_ value: Bool) {
+        stateLock.lock()
+        running = value
+        stateLock.unlock()
+    }
+
+    private func clearInterfaceTracking() {
+        stateLock.lock()
+        trackedInterfaceName = nil
+        baselineBytesIn = 0
+        baselineBytesOut = 0
+        stateLock.unlock()
+    }
+}
+
 final class PacketFlowDataPlane: TunnelDataPlane {
     private static let downstreamTCPPayloadChunkSize = 900
 

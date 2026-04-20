@@ -23,8 +23,13 @@ enum PacketTunnelProviderFactory {
             logStore: logStore,
             runtimeCoordinator: TunnelRuntimeCoordinator(
                 byedpiEngine: NativeByeDPIEngine(),
-                dataPlaneFactory: { _ in
-                    PacketFlowDataPlane(mode: .packetFlowPreferred)
+                dataPlaneFactory: { mode in
+                    switch mode {
+                    case .legacyTunFD:
+                        return LegacyTunFDDataPlane(mode: mode, tun2socksEngine: NativeTun2SocksEngine())
+                    case .packetFlowPreferred:
+                        return PacketFlowDataPlane(mode: mode)
+                    }
                 },
                 configurationStore: configurationStore,
                 snapshotStore: snapshotStore,
@@ -56,7 +61,7 @@ private final class DefaultPacketTunnelProviderRuntimeController: PacketTunnelPr
     ) async throws {
         let baseProfile = try loadProfile(logger: logger)
         let profile = ProviderStartOptions.mergedProfile(from: options, base: baseProfile)
-        let implementationMode: TunnelImplementationMode = .packetFlowPreferred
+        let implementationMode = TunnelImplementationMode.resolve(fromStartOptions: options)
         logger.info("Selected tunnel implementation mode: \(implementationMode.rawValue, privacy: .public)")
 
         try await runtimeCoordinator.start(

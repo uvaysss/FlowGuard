@@ -25,6 +25,9 @@ final class TunnelRuntimeStartupServiceTests: XCTestCase {
         XCTAssertNotNil(deps.stateStore.currentActiveDataPlane())
         XCTAssertEqual(deps.dataPlane.startCallCount, 1)
         XCTAssertEqual(deps.persistence.snapshots.last?.state, .running)
+        XCTAssertEqual(state.runtimeStats.startupImplementationMode, TunnelImplementationMode.packetFlowPreferred.rawValue)
+        XCTAssertNotNil(state.runtimeStats.startupDurationMs)
+        XCTAssertGreaterThanOrEqual(state.runtimeStats.startupDurationMs ?? -1, 0)
     }
 
     func testStartWhenPreferredPortBusyUsesFallbackAndUpdatesActiveProfile() async throws {
@@ -71,6 +74,8 @@ final class TunnelRuntimeStartupServiceTests: XCTestCase {
         XCTAssertFalse(state.isDataPlaneRunning)
         XCTAssertEqual(deps.byeDPI.startCallCount, 0)
         XCTAssertEqual(deps.persistence.snapshots.last?.state, .failed)
+        XCTAssertEqual(state.runtimeStats.startupImplementationMode, TunnelImplementationMode.packetFlowPreferred.rawValue)
+        XCTAssertNotNil(state.runtimeStats.startupDurationMs)
     }
 
     func testStartWhenByeDPIExitsBeforeSocksReadyThrowsByeDPIExited() async {

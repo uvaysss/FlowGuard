@@ -10,7 +10,7 @@ This repository vendors and/or links the following upstream projects:
 ## hev-socks5-tunnel
 - Project: https://github.com/heiher/hev-socks5-tunnel
 - License: BSD-3-Clause
-- Usage: retained as a vendored upstream dependency; not linked into the current packet-flow runtime path.
+- Usage: linked into the tunnel runtime as the speed-focused `legacyTunFD` data-plane path.
 
 ## Licensing posture for FlowGuard
 

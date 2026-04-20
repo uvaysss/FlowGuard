@@ -37,6 +37,7 @@ final class TunnelRuntimeStartupService {
         packetFlow: NEPacketTunnelFlow? = nil,
         applyNetworkSettingsHandler: @escaping (NEPacketTunnelNetworkSettings) async -> Bool
     ) async throws {
+        let startupStartedAt = Date()
         prepareStartupState(profile: profile, implementationMode: implementationMode)
 
         var didStartByeDPI = false
@@ -58,12 +59,14 @@ final class TunnelRuntimeStartupService {
             )
             didStartDataPlane = true
 
-            finalizeSuccessfulStartup()
+            finalizeSuccessfulStartup(startedAt: startupStartedAt, implementationMode: implementationMode)
         } catch {
             handleStartupFailure(
                 error: error,
                 didStartByeDPI: didStartByeDPI,
-                didStartDataPlane: didStartDataPlane
+                didStartDataPlane: didStartDataPlane,
+                startedAt: startupStartedAt,
+                implementationMode: implementationMode
             )
             throw error
         }
@@ -79,6 +82,9 @@ final class TunnelRuntimeStartupService {
                 selectedPreset: profile.preset,
                 lastError: nil
             )
+            $0.runtimeStats.startupDurationMs = nil
+            $0.runtimeStats.startupImplementationMode = implementationMode.rawValue
+            $0.runtimeStats.totalThroughputBytesPerSecond = nil
             $0.startedAt = nil
             $0.tunInterfaceName = nil
             $0.baselineBytesIn = 0
@@ -187,17 +193,30 @@ final class TunnelRuntimeStartupService {
         }
     }
 
-    private func finalizeSuccessfulStartup() {
+    private func finalizeSuccessfulStartup(startedAt: Date, implementationMode: TunnelImplementationMode) {
+        let startupDurationMs = Self.durationMilliseconds(since: startedAt)
         runtimeStateStore.updateState {
             $0.startedAt = Date()
             $0.providerState = .running
+            $0.runtimeStats.startupDurationMs = startupDurationMs
+            $0.runtimeStats.startupImplementationMode = implementationMode.rawValue
         }
+        appendLogBestEffort("Startup finished in \(startupDurationMs)ms mode=\(implementationMode.rawValue)")
         persistSnapshotBestEffort()
     }
 
-    private func handleStartupFailure(error: Error, didStartByeDPI: Bool, didStartDataPlane: Bool) {
+    private func handleStartupFailure(
+        error: Error,
+        didStartByeDPI: Bool,
+        didStartDataPlane: Bool,
+        startedAt: Date,
+        implementationMode: TunnelImplementationMode
+    ) {
+        let startupDurationMs = Self.durationMilliseconds(since: startedAt)
         runtimeStateStore.updateState {
             $0.runtimeStats.lastError = error.localizedDescription
+            $0.runtimeStats.startupDurationMs = startupDurationMs
+            $0.runtimeStats.startupImplementationMode = implementationMode.rawValue
             $0.providerState = .failed
             $0.startedAt = nil
             $0.tunInterfaceName = nil
@@ -205,7 +224,7 @@ final class TunnelRuntimeStartupService {
             $0.baselineBytesOut = 0
         }
         persistSnapshotBestEffort()
-        appendLogBestEffort("Startup failed: \(error.localizedDescription)")
+        appendLogBestEffort("Startup failed in \(startupDurationMs)ms mode=\(implementationMode.rawValue): \(error.localizedDescription)")
         lifecycleService.rollbackStartup(didStartByeDPI: didStartByeDPI, didStartDataPlane: didStartDataPlane)
     }
 
@@ -221,6 +240,10 @@ final class TunnelRuntimeStartupService {
     private func persistSnapshotBestEffort() {
         let snapshot = runtimeStateStore.makePersistentSnapshot(now: Date())
         persistenceService.persistSnapshot(state: snapshot.state, stats: snapshot.stats)
+    }
+
+    private static func durationMilliseconds(since startedAt: Date, now: Date = Date()) -> Int64 {
+        Int64(max(0, (now.timeIntervalSince(startedAt) * 1_000.0).rounded()))
     }
 }
 

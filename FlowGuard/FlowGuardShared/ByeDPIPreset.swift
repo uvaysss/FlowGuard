@@ -20,7 +20,8 @@ enum ByeDPIPreset: String, Codable, CaseIterable, Sendable {
             return [
                 "--pf", "443", "--proto", "tls",
                 "--disorder", "1", "--split", "-5+se", "--auto", "none",
-                "--pf", "80", "--proto", "http", "--auto", "none"
+                "--pf", "80", "--proto", "http", "--auto", "none",
+                "--proto", "udp", "--udp-fake", "1"
             ]
         case .forYoutube:
             return ["--split", "1"]

@@ -6,6 +6,9 @@ struct RuntimeStats: Codable, Sendable {
     var bytesOut: Int64
     var selectedPreset: ByeDPIPreset
     var lastError: String?
+    var startupDurationMs: Int64? = nil
+    var startupImplementationMode: String? = nil
+    var totalThroughputBytesPerSecond: Double? = nil
     var packetsIn: Int64? = nil
     var packetsOut: Int64? = nil
     var parseFailures: Int64? = nil

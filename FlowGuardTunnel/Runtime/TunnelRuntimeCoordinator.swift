@@ -31,8 +31,13 @@ final class TunnelRuntimeCoordinator {
 
     init(
         byedpiEngine: ByeDPIEngine = NativeByeDPIEngine(),
-        dataPlaneFactory: @escaping (TunnelImplementationMode) -> TunnelDataPlane = { _ in
-            PacketFlowDataPlane(mode: .packetFlowPreferred)
+        dataPlaneFactory: @escaping (TunnelImplementationMode) -> TunnelDataPlane = { mode in
+            switch mode {
+            case .legacyTunFD:
+                return LegacyTunFDDataPlane(mode: mode, tun2socksEngine: NativeTun2SocksEngine())
+            case .packetFlowPreferred:
+                return PacketFlowDataPlane(mode: mode)
+            }
         },
         networkSettingsBuilder: TunnelNetworkSettingsBuilding = DefaultTunnelNetworkSettingsBuilder(),
         portAllocator: LocalhostPortAllocating = DefaultLocalhostPortAllocator(),

@@ -5,6 +5,10 @@ import XCTest
 final class TunnelRuntimeStatsServiceTests: XCTestCase {
     func testCollectStatsMapsExtendedDataPlaneCounters() {
         let store = TunnelRuntimeStateRepository()
+        store.updateState {
+            $0.implementationMode = .legacyTunFD
+            $0.startedAt = Date(timeIntervalSince1970: 100)
+        }
         let dataPlane = StatsMockDataPlane(snapshot: DataPlaneTrafficSnapshot(
             bytesIn: 100,
             bytesOut: 200,
@@ -59,10 +63,14 @@ final class TunnelRuntimeStatsServiceTests: XCTestCase {
         XCTAssertEqual(stats.udpSessionCloseBackpressureDrop, 1)
         XCTAssertEqual(stats.udpSessionCloseIdleCleanup, 3)
         XCTAssertEqual(stats.udpSessionCloseRelayStop, 2)
+        XCTAssertEqual(stats.startupImplementationMode, TunnelImplementationMode.legacyTunFD.rawValue)
+        XCTAssertEqual(stats.totalThroughputBytesPerSecond ?? -1, 3.0, accuracy: 0.0001)
 
         let persisted = store.withState { $0.runtimeStats }
         XCTAssertEqual(persisted.tcpSessionCloseTotal, 7)
         XCTAssertEqual(persisted.udpSessionCloseTotal, 15)
+        XCTAssertEqual(persisted.startupImplementationMode, TunnelImplementationMode.legacyTunFD.rawValue)
+        XCTAssertEqual(persisted.totalThroughputBytesPerSecond ?? -1, 3.0, accuracy: 0.0001)
     }
 }
 

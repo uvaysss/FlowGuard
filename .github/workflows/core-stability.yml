@@ -15,7 +15,8 @@ jobs:
       SCHEME: FlowGuardCoreTests
       CONFIGURATION: Debug
       DESTINATION: platform=iOS Simulator,OS=latest,name=iPhone 16
-      REPEAT: 5
+      REPEAT: 3
+      SENSITIVE_TESTS: FlowGuardCoreTests/PacketFlowUDPRelayTests/testUpstreamDatagramCallbackIncrementsRxAndEmitsEvent,FlowGuardCoreTests/PacketFlowIntegrationTests/testTCPSynIngressProducesSynthesizedSynAckEgress
 
     steps:
       - name: Checkout

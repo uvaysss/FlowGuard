@@ -58,7 +58,7 @@ struct TunnelRuntimeState {
     var runtimeStats: RuntimeStats = .empty
     var startedAt: Date?
     var activeProfile: TunnelProfile = .default
-    var implementationMode: TunnelImplementationMode = .packetFlowPreferred
+    var implementationMode: TunnelImplementationMode = .legacyTunFD
     var tunInterfaceName: String?
     var baselineBytesIn: UInt64 = 0
     var baselineBytesOut: UInt64 = 0

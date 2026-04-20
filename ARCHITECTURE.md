@@ -47,8 +47,8 @@
 
 ### Tunnel Path Policy
 
-- Production path: `packetFlowPreferred` only.
-- Backward compatibility: persisted/remote legacy mode strings are normalized to `packetFlowPreferred` at decode boundaries.
+- Speed-first path: `legacyTunFD` (`hev-socks5-tunnel`) is the default production mode.
+- Compatibility path: `packetFlowPreferred` remains available and selectable via start option `flowguard.tunnelImplementationMode`.
 
 ## Current SOLID/KISS/DRY Problems
 
@@ -110,7 +110,7 @@
   - moved `collectStats` command path into `TunnelRuntimeCommandHandlerService` so coordinator command branch is pure routing;
   - split host controller responsibilities into dedicated `FlowGuard/Host/*Service.swift` files;
   - moved tunnel provider wiring into `PacketTunnelProviderBootstrap`;
-  - finalized runtime on packet-flow-only startup and data-plane composition.
+  - re-enabled dual data-plane composition with speed-first `legacyTunFD` (hev) and compatibility `packetFlowPreferred`.
 - Next best step:
   - split startup flow internally into smaller use-case parts (`select-port`, `apply-network-settings`, `start-engines`) to simplify targeted testing.
 
@@ -122,11 +122,11 @@
   - `./scripts/core-stability-check.sh`
 - Optional tuning:
   - `REPEAT=30 ./scripts/core-stability-check.sh`
-  - `SENSITIVE_TESTS='FlowGuardCoreTests/PacketFlowUDPRelayTests/testUpstreamDatagramCallbackIncrementsRxAndEmitsEvent,FlowGuardCoreTests/PacketFlowIntegrationTests/testMalformedIngressIncrementsPumpParseFailuresMetric' ./scripts/core-stability-check.sh`
+  - `SENSITIVE_TESTS='FlowGuardCoreTests/PacketFlowUDPRelayTests/testUpstreamDatagramCallbackIncrementsRxAndEmitsEvent,FlowGuardCoreTests/PacketFlowIntegrationTests/testTCPSynIngressProducesSynthesizedSynAckEgress' ./scripts/core-stability-check.sh`
   - `INFRA_RETRY_MAX=2 INFRA_RETRY_DELAY_SEC=2 ./scripts/core-stability-check.sh`
 - Notes:
   - Uses project/scheme/destination defaults that match current core test runs.
-  - Exits `0` on full success, `1` on any failure, and prints a pass/fail summary.
+  - Exits `0` on full success, `1` on any failure, and prints per-test and global pass/fail summaries.
   - Per `xcodebuild` invocation, retries are limited (`INFRA_RETRY_MAX`, default `2`) and only used for known simulator/Xcode infrastructure failures.
   - Regular test failures/assertions are never retried.
   - Infra retry signatures include:
@@ -135,6 +135,19 @@
     - simulator device-set bootstrap failures (`Unable to locate device set`, `Failed to initialize simulator device set`, `SimDeviceSet observer` registration failures);
     - `simdiskimaged` / `SimDiskImageManager` instability;
     - common `simctl` device-preparation failures.
-  - Summary includes infra retry counters for stress runs, full-suite run, total retries, and retried invocation count.
-  - CI gate runs this script on `push` and `pull_request` via `.github/workflows/core-stability.yml` with `REPEAT=5` by default.
+  - Summary includes per-sensitive-test counters and infra retry counters for stress runs, full-suite run, total retries, and retried invocation count.
+  - CI gate runs this script on `push` and `pull_request` via `.github/workflows/core-stability.yml` with `REPEAT=3` and explicit UDP+TCP sensitive test list.
   - To tune CI sensitivity or duration, change `REPEAT` in workflow env or override it for local runs.
+
+## Runtime A/B Smoke
+
+- Script: `scripts/runtime-ab-smoke.sh`
+- Purpose: run `core-stability-check` sequentially for both runtime modes and print side-by-side elapsed time/status summary.
+- Default command:
+  - `./scripts/runtime-ab-smoke.sh`
+- Optional tuning:
+  - `REPEAT=5 ./scripts/runtime-ab-smoke.sh`
+  - `MODES='legacyTunFD,packetFlowPreferred' ./scripts/runtime-ab-smoke.sh`
+- Notes:
+  - Uses env `FLOWGUARD_TUNNEL_IMPLEMENTATION_MODE` for each run.
+  - This is a smoke A/B comparator (health + rough elapsed time), not a formal throughput benchmark.

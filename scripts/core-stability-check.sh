@@ -8,7 +8,7 @@ SCHEME="${SCHEME:-FlowGuardCoreTests}"
 CONFIGURATION="${CONFIGURATION:-Debug}"
 DESTINATION="${DESTINATION:-platform=iOS Simulator,name=iPhone 17,OS=26.3.1}"
 REPEAT="${REPEAT:-20}"
-SENSITIVE_TESTS="${SENSITIVE_TESTS:-FlowGuardCoreTests/PacketFlowUDPRelayTests/testUpstreamDatagramCallbackIncrementsRxAndEmitsEvent}"
+SENSITIVE_TESTS="${SENSITIVE_TESTS:-FlowGuardCoreTests/PacketFlowUDPRelayTests/testUpstreamDatagramCallbackIncrementsRxAndEmitsEvent,FlowGuardCoreTests/PacketFlowIntegrationTests/testTCPSynIngressProducesSynthesizedSynAckEgress}"
 INFRA_RETRY_MAX="${INFRA_RETRY_MAX:-2}"
 INFRA_RETRY_DELAY_SEC="${INFRA_RETRY_DELAY_SEC:-2}"
 
@@ -104,20 +104,32 @@ for raw_test in "${TEST_ARRAY[@]}"; do
   fi
 
   echo "[stress] $test_id"
+  test_runs=0
+  test_passed=0
+  test_failed=0
+  test_infra_retries=0
+  test_retried_invocations=0
   run=1
   while [ "$run" -le "$REPEAT" ]; do
+    test_runs=$((test_runs + 1))
     stress_total=$((stress_total + 1))
     printf "  - run %d/%d ... " "$run" "$REPEAT"
     if run_xcodebuild_with_infra_retry "$LAST_LOG" -project "$PROJECT" -scheme "$SCHEME" -configuration "$CONFIGURATION" -destination "$DESTINATION" CODE_SIGNING_ALLOWED=NO test -only-testing:"$test_id" -quiet; then
+      test_passed=$((test_passed + 1))
       stress_passed=$((stress_passed + 1))
       if [ "$RUN_LAST_INFRA_RETRIES" -gt 0 ]; then
+        test_infra_retries=$((test_infra_retries + RUN_LAST_INFRA_RETRIES))
+        test_retried_invocations=$((test_retried_invocations + 1))
         stress_infra_retries=$((stress_infra_retries + RUN_LAST_INFRA_RETRIES))
         infra_retried_invocations=$((infra_retried_invocations + 1))
       fi
       echo "PASS (infra-retries: $RUN_LAST_INFRA_RETRIES)"
     else
+      test_failed=$((test_failed + 1))
       stress_failed=$((stress_failed + 1))
       if [ "$RUN_LAST_INFRA_RETRIES" -gt 0 ]; then
+        test_infra_retries=$((test_infra_retries + RUN_LAST_INFRA_RETRIES))
+        test_retried_invocations=$((test_retried_invocations + 1))
         stress_infra_retries=$((stress_infra_retries + RUN_LAST_INFRA_RETRIES))
         infra_retried_invocations=$((infra_retried_invocations + 1))
       fi
@@ -125,6 +137,7 @@ for raw_test in "${TEST_ARRAY[@]}"; do
     fi
     run=$((run + 1))
   done
+  echo "  Summary: passed $test_passed/$test_runs, failed $test_failed/$test_runs, infra-retries $test_infra_retries, retried-invocations $test_retried_invocations"
 done
 
 echo
